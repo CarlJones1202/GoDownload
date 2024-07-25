@@ -5,17 +5,19 @@ import (
 	"github.com/gocolly/colly/v2"
 	"io"
 	"net/http"
-	url "net/url"
+	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"path"
 	"strings"
+	"time"
 )
 
 func main() {
-	targetUrl := []string{}
+	targetUrls := []string{}
 
-	for _, url := range targetUrl {
-		DownloadGallery(url)
+	for _, targetUrl := range targetUrls {
+		DownloadGallery(targetUrl)
 	}
 }
 func DownloadGallery(targetUrl string) {
@@ -29,7 +31,7 @@ func DownloadGallery(targetUrl string) {
 		postId += split[len(split)-1]
 	}
 
-	directory := fmt.Sprintf("C:\\Downloads\\%s\\", path.Base(u.Path))
+	directory := fmt.Sprintf("C:\\Users\\carlj\\Downloads\\%s\\", path.Base(u.Path))
 
 	if _, err := os.Stat(directory); err == nil {
 		fmt.Println("Already downloaded: " + targetUrl)
@@ -45,6 +47,8 @@ func DownloadGallery(targetUrl string) {
 				a := element.DOM.Parent()
 				src, _ := a.Attr("href")
 				switch {
+				case strings.Contains(src, "imagebam"):
+					src = RipImageBam(src)
 				case strings.Contains(src, "imgbox"):
 					src = RipImageBox(element.Attr("src"))
 				case strings.Contains(src, "imx.to"):
@@ -72,27 +76,43 @@ func DownloadGallery(targetUrl string) {
 		}
 	})
 
-	c.Visit(targetUrl)
+	_ = c.Visit(targetUrl)
 	fmt.Println("Downloaded: " + targetUrl)
 }
 
-/*
-if (src.Contains("thumbs"))
-{
-	var url = input.Data.GetSrc().Replace("thumbs", "images").Replace("_t", "_o");
-	yield return new DownloadImageDataPackage(url);
+func RipImageBam(src string) string {
+	c := colly.NewCollector()
+	cookieJar, _ := cookiejar.New(nil)
+
+	cookies := make([]*http.Cookie, 2)
+	cookies[0] = &http.Cookie{
+		Name:   "nsfw_inter",
+		Value:  "1",
+		Path:   "/",
+		Domain: "imagebam.com",
+	}
+	cookies[1] = &http.Cookie{
+		Name:   "expires",
+		Value:  time.Now().AddDate(0, 0, 1).String(),
+		Path:   "/",
+		Domain: "imagebam.com",
+	}
+
+	targetUrl, _ := url.Parse("https://imagebam.com")
+	cookieJar.SetCookies(targetUrl, cookies)
+	c.SetCookieJar(cookieJar)
+
+	c.OnHTML("img.main-image", func(e *colly.HTMLElement) {
+		src = e.Attr("src")
+	})
+
+	err := c.Visit(src)
+	if err != nil {
+		panic(err)
+	}
+
+	return src
 }
-
-var handler = new HttpClientHandler();
-handler.AllowAutoRedirect = true;
-var web = new HttpClient(handler);
-
-var resp = await web.GetAsync(src);
-var t = resp.RequestMessage.RequestUri;
-
-var redirected_url = resp.RequestMessage.RequestUri.ToString().Replace("thumbs", "images").Replace("_t", "_o");
-
-*/
 
 func RipImageBox(src string) string {
 	if strings.Contains(src, "_o") {
@@ -147,14 +167,18 @@ func DownloadFile(url string, filepath string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer func(out *os.File) {
+		_ = out.Close()
+	}(out)
 
 	// Get the data
 	resp, err := http.Get(url)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		_ = Body.Close()
+	}(resp.Body)
 
 	// Write the body to file
 	_, err = io.Copy(out, resp.Body)
