@@ -14,15 +14,144 @@ import (
 )
 
 func main() {
-	targetUrls := []string{}
+	targetUrls := []string{
+		"https://vipergirls.to/threads/7453834-Mary-Rock-That-Smile-x138-(10-22-22)",
+		"https://vipergirls.to/threads/10870156-Mary-Rock-Stunning-Beauty-x155-(05-27-24)",
+		"https://vipergirls.to/threads/4806096-Mary-Rock-Honey-I-m-Home-(14-10-2019)-218x",
+		"https://vipergirls.to/threads/4896475-Mary-Rock-Nancy-A-Pretty-Blonde-Pussy-Licking-Orgasms-(24-11-2019)-128x",
+		"https://vipergirls.to/threads/5034923-MetArt-com-Mary-Rock-Goldilocks-(Jan-31-2020)",
+		"https://vipergirls.to/threads/5439939-Watch4Beauty-com-Mary-Rock-Casting-Mary-Rock-(Jul-28-2020)",
+		"https://vipergirls.to/threads/5938521-Mary-Rock-in-Piqued-Interest?p=79857493#post79857493",
+		"https://vipergirls.to/threads/11234895-Mary-Rock-Magnificence-1-118-pictures-7008px-(19-Jul-2024)",
+		"https://vipergirls.to/threads/5276558-SexArt-com-Mary-Rock-Afternoon-Light-(May-12-2020)",
+		"https://vipergirls.to/threads/3633805-Mary-Rock-Rub-Down-x74-3600px-Apr-26-2018",
+		"https://vipergirls.to/threads/5980576-Mary-Rock-Dotted",
+		"https://vipergirls.to/threads/7269427-Cornelia-Mary-Rock-Lickers-In-White-68x-5000-x-3333px-January-25-2022",
+		"https://vipergirls.to/threads/5954104-Mary-Rock-Climax-(05-03-2021)-103x",
+		"https://vipergirls.to/threads/7231807-Mary-Rock-Personal-Passion-140-Photos-Jul-26-2022",
+		"https://vipergirls.to/threads/8176253-MetArt-com-Mary-Rock-Vivacious-(May-01-2023)",
+		"https://vipergirls.to/threads/9138388-2023-10-02-Mary-Rock-Enchanting-x145",
+		"https://vipergirls.to/threads/6407980-Amirah-Adara-Mary-Rock-Squats-and-Scissoring-75x-3000x2000-10-04-2021",
+		"https://vipergirls.to/threads/6171788-Mary-Rock-Prairie",
+		"https://vipergirls.to/threads/8720389-MetArt-com-Mary-Rock-Rising-Heat-(Jul-15-2023)",
+		"https://vipergirls.to/threads/9349969-MetArt-com-Mary-Rock-Flirty-Delight-(Nov-08-2023)",
+		"https://vipergirls.to/threads/7807060-MetArt-com-Mary-Rock-Enthralling-(Feb-09-2023)",
+		"https://vipergirls.to/threads/6845181-Mary-Rock-Lime-Love-x126-(March-6-2022)",
+		"https://vipergirls.to/threads/5370800-MetArt-com-Mary-Rock-Pastime-(Jun-26-2020)",
+		"https://vipergirls.to/threads/5453934-MetArt-com-Mary-Rock-Dazzle_1-Me-(Aug-04-2020)",
+		"https://vipergirls.to/threads/9258721-Mary-Rock-Challenge-(X121)-3648x5472",
+		"https://vipergirls.to/threads/9450664-Mary-Rock-Primitive-(X120)-4480x6720",
+		"https://vipergirls.to/threads/4982765-FemJoy-com-Mary-Rock-Seduction-(Jan-05-2020)",
+		"https://vipergirls.to/threads/6341698-Mary-Rock-in-Her-Passion-116-5500px-09-05-2021",
+		"https://vipergirls.to/threads/6224582-Mary-Rock-in-Glimmer-x118-5500px-07-16-2021",
+		"https://vipergirls.to/threads/6954056-Mary-Rock-Memorable-116-Photos-Apr-14-2022",
+		"https://vipergirls.to/threads/6280239-Mary-Rock-Solo-Travel-14-Aug",
+		"https://vipergirls.to/threads/5584658-Mary-Rock-TEASE-115-Photos-Oct-07-2020",
+		"https://vipergirls.to/threads/5724144-Mary-Rock-Roseate-x74-8688px-(12-10-2020)",
+		"https://vipergirls.to/threads/5854962-Mary-Rock-Come-Into-My-Bed-x74-5760px-01-25-2021",
+		"https://vipergirls.to/threads/5048643-Mary-Rock-in-New-Stockings-x120-5500px-(02-07-2020)?p=59361443&viewfull=1#post59361443",
+		"https://vipergirls.to/threads/10472317-Mary-Rock-Intimate-With-Nature-120-pictures-5040px-(11-Apr-2024)",
+		"https://vipergirls.to/threads/10130457-Mary-Rock-Glow-121-pictures-5472px-(26-Feb-2024)",
+		"https://vipergirls.to/threads/7035192-Mary-Rock-Installation-157-Photos-May-15-2022",
+		"https://vipergirls.to/threads/6446696-Mary-Rock-Soft-Leather-120-Photos-Oct-19-2021?p=92530142#post92530142",
+		"https://vipergirls.to/threads/9228655-Mary-Rock-Resistance-(X120)-3360x5040",
+		"https://vipergirls.to/threads/6243575-Mary-Rock-Feather-120-Photos-Jul-25-2021",
+		"https://vipergirls.to/threads/6203234-Mary-Rock-Urban-Pleasure-126-Photos-Jul-05-2021",
+		"https://vipergirls.to/threads/6151126-Mary-Rock-Zuzu-Sweet-Loving-Smile-(10-06-2021)-135x",
+		"https://vipergirls.to/threads/5861200-Mary-Rock-Beachrock-120-Photos-Jan-27-2021",
+		"https://vipergirls.to/threads/6282477-Mary-Rock-in-Shine-126-Photos-5000px",
+		"https://vipergirls.to/threads/5583460-SexArt-com-Mary-Rock-Lush-(Oct-06-2020)",
+		"https://vipergirls.to/threads/5393466-Mary-Rock-Warm-Light-(Jul-07-2020)-130x?p=66829071&viewfull=1#post66829071",
+		"https://vipergirls.to/threads/5036993-SexArt-com-Mary-Rock-Garter-Belt-(Feb-01-2020)",
+		"https://vipergirls.to/threads/4990561-Mary-Rock-Mary-Rock-120-pictures-6720px-(9-Jan-2020)?p=57936777&viewfull=1#post57936777",
+		"https://vipergirls.to/threads/6021281-Mary-Rock-Rock-Steady-68-Photos-April-13-2021-Upcoming-Release",
+		"https://vipergirls.to/threads/7573454-Lily-Chey-(Guerlain-Lilii-Natalia-E-Lily-C-Violetta-Raisa-Marcella-Anastasia)[range]",
+		"https://vipergirls.to/threads/7526563-Femjoy-(complete-collection-in-chronological-order)[range]",
+		"https://vipergirls.to/threads/6437219-Photodromm-Collection[range]",
+		"https://vipergirls.to/threads/7049792-Nancy-Ace?highlight=nancy+a[range]",
+	}
 
 	for _, targetUrl := range targetUrls {
-		DownloadGallery(targetUrl)
+		DownloadLink(targetUrl)
 	}
 }
-func DownloadGallery(targetUrl string) {
+
+func DownloadLink(targetUrl string) {
+	if !strings.Contains(targetUrl, "[range]") {
+		DownloadGallery(targetUrl, "")
+	} else {
+		//get all posts in gallery
+		posts := ListAllPosts(targetUrl)
+		for _, post := range posts {
+			postId := ""
+			if strings.Contains(post, "#post") {
+				split := strings.Split(post, "#post")
+				postId = split[len(split)-1]
+			}
+			DownloadGallery(post, postId)
+		}
+	}
+}
+
+func ListAllPosts(targetUrl string) []string {
+	targetUrl = strings.ReplaceAll(targetUrl, "[range]", "")
+
+	if strings.Contains(targetUrl, "#post") {
+		return []string{
+			targetUrl,
+		}
+	}
+
+	if strings.Contains(targetUrl, "/page") {
+		targetUrl = strings.Split(targetUrl, "/page")[0]
+	}
+
+	targetUrl += "/page"
+	postUrls := map[string]string{}
+	shouldRun := true
+	page := 1
+	currentPage := fmt.Sprintf("%s%v", targetUrl, page)
+
 	c := colly.NewCollector()
-	u, _ := url.Parse(targetUrl)
+
+	c.OnHTML("[id^='post_message_']", func(e *colly.HTMLElement) {
+		postId := strings.ReplaceAll(e.Attr("id"), "post_message_", "")
+		_, ok := postUrls[postId]
+		if ok {
+			shouldRun = false
+			return
+		}
+
+		postUrls[postId] = currentPage + "#post" + postId
+	})
+
+	for shouldRun {
+		currentPage = fmt.Sprintf("%s%v", targetUrl, page)
+		page = page + 1
+
+		err := c.Visit(currentPage)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	var urls []string
+	for _, value := range postUrls {
+		urls = append(urls, value)
+	}
+
+	return urls
+}
+
+func DownloadGallery(targetUrl string, title string) {
+	c := colly.NewCollector()
+
+	tempTarget := targetUrl
+	if strings.Contains(tempTarget, "/page") {
+		tempTarget = strings.Split(targetUrl, "/page")[0]
+	}
+
+	u, _ := url.Parse(tempTarget)
 	u.RawQuery = ""
 
 	postId := "post_message_"
@@ -31,7 +160,11 @@ func DownloadGallery(targetUrl string) {
 		postId += split[len(split)-1]
 	}
 
-	directory := fmt.Sprintf("C:\\Users\\carlj\\Downloads\\%s\\", path.Base(u.Path))
+	directory := "C:\\Users\\carlj\\Downloads\\" + path.Base(u.Path)
+
+	if title != "" {
+		directory += "-" + title
+	}
 
 	if _, err := os.Stat(directory); err == nil {
 		fmt.Println("Already downloaded: " + targetUrl)
