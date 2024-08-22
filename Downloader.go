@@ -2,19 +2,30 @@ package main
 
 import (
 	"fmt"
-	"github.com/gocolly/colly/v2"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/gocolly/colly/v2"
 )
 
 func main() {
 	targetUrls := []string{
+		"https://vipergirls.to/threads/11374567-Stacy-Cruz-Sunday-Funday-159-pictures-6048px-(4-Aug-2024)?p=195262111",
+		"https://vipergirls.to/threads/10639992-Lee-Anne-Classical-Beauty-138-pictures-px-(29-Apr-2024)?p=175797485",
+		"https://vipergirls.to/threads/9122962-MetArt-com-Lee-Anne-My-Pearls-(Sep-23-2023)",
+		"https://vipergirls.to/threads/9918011-MetArt-com-Lee-Anne-Pale-Pink-Lace-(Jan-29-2024)",
+		"https://vipergirls.to/threads/9291626-Lee-Anne-Pure-Glamour-x145-(10-27-23)",
+		"https://vipergirls.to/threads/9489852-Lee-Anne-Sultry-(x131)-2912x4368",
+		"https://vipergirls.to/threads/8789527-Lee-Anne-New-Style-x152-(07-31-23)",
+		"https://vipergirls.to/threads/9574122-Lee-Anne-Lee-Anne-85-pictures-5472px-(22-Dec-2023)",
 		"https://vipergirls.to/threads/7453834-Mary-Rock-That-Smile-x138-(10-22-22)",
 		"https://vipergirls.to/threads/10870156-Mary-Rock-Stunning-Beauty-x155-(05-27-24)",
 		"https://vipergirls.to/threads/4806096-Mary-Rock-Honey-I-m-Home-(14-10-2019)-218x",
@@ -68,12 +79,26 @@ func main() {
 		"https://vipergirls.to/threads/7573454-Lily-Chey-(Guerlain-Lilii-Natalia-E-Lily-C-Violetta-Raisa-Marcella-Anastasia)[range]",
 		"https://vipergirls.to/threads/7526563-Femjoy-(complete-collection-in-chronological-order)[range]",
 		"https://vipergirls.to/threads/6437219-Photodromm-Collection[range]",
-		"https://vipergirls.to/threads/7049792-Nancy-Ace?highlight=nancy+a[range]",
+		"https://vipergirls.to/threads/4977729-Hegre-Archives[range]",
+		"https://vipergirls.to/threads/5478451-Amour-Angels-Heaven-of-Sensuality-complete-amp-updated[range]",
+		"https://vipergirls.to/threads/6122206-ATKingdom-All-Collections[range]",
+		"https://vipergirls.to/threads/7526563-Femjoy-(complete-collection-in-chronological-order)[range]",
+		"https://vipergirls.to/threads/5144955-***ISTRIPPER-MODEL-COLLECTIONS***[range]",
+		"https://vipergirls.to/threads/10158645-AJ-APPLEGATE-(aka-Kaylee-Evans-Ajay-Applegate-Danielle)",
+		"https://vipergirls.to/threads/10573735-RED-FOX-(aka-Michelle-H-Foxy-T-Marga-E-Micca-Michelle-Starr-Nalla-Naomi-Noemi-Ruda-Sereti-Zania-Burlechenko)[range]",
+		// "https://vipergirls.to/threads/7049792-Nancy-Ace?highlight=nancy+a[range]",
 	}
 
+	var wg sync.WaitGroup
+
 	for _, targetUrl := range targetUrls {
-		DownloadLink(targetUrl)
+		wg.Add(1)
+		go func(url string) {
+			defer wg.Done()
+			DownloadLink(url)
+		}(targetUrl)
 	}
+	wg.Wait()
 }
 
 func DownloadLink(targetUrl string) {
@@ -160,7 +185,7 @@ func DownloadGallery(targetUrl string, title string) {
 		postId += split[len(split)-1]
 	}
 
-	directory := "C:\\Users\\carlj\\Downloads\\" + path.Base(u.Path)
+	directory := "C:\\Users\\carlj\\Downloads\\" + sanitizeFolderName(path.Base(u.Path))
 
 	if title != "" {
 		directory += "-" + title
@@ -177,32 +202,40 @@ func DownloadGallery(targetUrl string, title string) {
 	c.OnHTML(fmt.Sprintf("div[id^='%s']", postId), func(e *colly.HTMLElement) {
 		if isFirstMatch {
 			e.ForEach("a img", func(i int, element *colly.HTMLElement) {
-				a := element.DOM.Parent()
-				src, _ := a.Attr("href")
-				switch {
-				case strings.Contains(src, "imagebam"):
-					src = RipImageBam(src)
-				case strings.Contains(src, "imgbox"):
-					src = RipImageBox(element.Attr("src"))
-				case strings.Contains(src, "imx.to"):
-					src = RipImx(element.Attr("src"))
-				case strings.Contains(src, "turboimagehost"):
-					src = RipTurboImg(src)
-				case strings.Contains(src, "vipr.im"):
-					src = RipViprIm(element.Attr("src"))
-				case strings.Contains(src, "pixhost"):
-					src = RipPixHost(element.Attr("src"))
-				case strings.Contains(src, "acidimg"):
-					src = RipAcidImg(element.Attr("src"))
-				default:
-					panic(fmt.Sprintf("Unknown image source %v", src))
-				}
+				if element.Attr("alt") != "View Post" {
+					a := element.DOM.Parent()
+					src, _ := a.Attr("href")
+					switch {
+					case strings.Contains(src, "imagebam"):
+						src = RipImageBam(src)
+					case strings.Contains(src, "imgbox"):
+						src = RipImageBox(src)
+					case strings.Contains(src, "imx.to"):
+						src = RipImx(element.Attr("src"))
+					case strings.Contains(src, "turboimagehost"):
+						src = RipTurboImg(src)
+					case strings.Contains(src, "vipr.im"):
+						src = RipViprIm(element.Attr("src"))
+					case strings.Contains(src, "pixhost"):
+						src = RipPixHost(element.Attr("src"))
+					case strings.Contains(src, "acidimg"):
+						src = RipAcidImg(element.Attr("src"))
+					case strings.Contains(src, "pixxxels.cc") || strings.Contains(src, "freeimage.us"):
+						src = ""
+					case strings.Contains(src, "postimages.org"):
+						src = RipPostImages(src)
+					default:
+						fmt.Printf("Error: Unknown image source %v on source %v", src, targetUrl)
+					}
 
-				filename := path.Base(src)
+					if src != "" {
+						filename := path.Base(src)
 
-				err := DownloadFile(src, fmt.Sprintf("%s\\%s", directory, filename))
-				if err != nil {
-					panic(err)
+						err := DownloadFile(src, fmt.Sprintf("%s\\%s", directory, filename))
+						if err != nil {
+							fmt.Printf("Error: error while downloading (%v) from: %v\n%v\n", src, targetUrl, err)
+						}
+					}
 				}
 			})
 			isFirstMatch = false
@@ -248,11 +281,21 @@ func RipImageBam(src string) string {
 }
 
 func RipImageBox(src string) string {
-	if strings.Contains(src, "_o") {
-		return src
-	} else {
-		panic("unknown image box path")
+	c := colly.NewCollector()
+
+	c.OnHTML("#img", func(e *colly.HTMLElement) {
+		src = e.Attr("src")
+	})
+
+	err := c.Visit(src)
+	if err != nil {
+		panic(err)
 	}
+	return src
+}
+
+func RipPostImages(src string) string {
+	return src
 }
 
 func RipViprIm(src string) string {
@@ -320,4 +363,17 @@ func DownloadFile(url string, filepath string) error {
 	}
 
 	return nil
+}
+
+func sanitizeFolderName(name string) string {
+	// Regular expression to match characters not allowed in folder names
+	invalidCharsRegex := regexp.MustCompile("[<>:\"/\\|?*]")
+
+	// Replace invalid characters with underscores
+	sanitizedName := invalidCharsRegex.ReplaceAllString(name, "_")
+
+	// Ensure the name doesn't start or end with an underscore
+	sanitizedName = strings.Trim(sanitizedName, "_")
+
+	return sanitizedName
 }
