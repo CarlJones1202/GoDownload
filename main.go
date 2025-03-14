@@ -206,68 +206,47 @@ func taggingService() {
 }
 
 // Placeholder for photo processing and tagging
-func processPhotoForTagging(filePath string) error {
+func processPhotoForTagging(photoPath string) error {
 	var galleryURL string
 	err := db.QueryRow(`
         SELECT r.url 
         FROM photos p 
         JOIN requests r ON p.request_id = r.id 
-        WHERE p.file_path = ?`, filePath).Scan(&galleryURL)
+        WHERE p.file_path = ?`, photoPath).Scan(&galleryURL)
 	if err != nil {
-		return fmt.Errorf("fetching gallery URL for %s: %v", filePath, err)
+		return fmt.Errorf("fetching gallery URL for %s: %v", photoPath, err)
 	}
+	log.Printf("Processing photo %s with gallery URL: %s", photoPath, galleryURL)
 
-	personName := extractPersonNameFromURL(galleryURL)
-	if personName == "" {
+	name := extractPersonNameFromURL(galleryURL)
+	if name == "" {
+		log.Printf("No valid name extracted from %s", galleryURL)
 		return nil
 	}
+	log.Printf("Extracted name for tagging: %s", name)
 
-	// Handle main name
 	var personID int
-	err = db.QueryRow("SELECT id FROM people WHERE name = ?", personName).Scan(&personID)
+	err = db.QueryRow("SELECT id FROM people WHERE name = ?", name).Scan(&personID)
 	if err == sql.ErrNoRows {
-		res, err := db.Exec("INSERT INTO people (name) VALUES (?)", personName)
+		res, err := db.Exec("INSERT INTO people (name) VALUES (?)", name)
 		if err != nil {
-			return fmt.Errorf("inserting person %s: %v", personName, err)
+			return fmt.Errorf("inserting person %s: %v", name, err)
 		}
 		id, _ := res.LastInsertId()
 		personID = int(id)
+		log.Printf("Created new person %s with ID %d", name, personID)
 	} else if err != nil {
-		return fmt.Errorf("querying person %s: %v", personName, err)
+		return fmt.Errorf("fetching person %s: %v", name, err)
 	}
 
-	_, err = db.Exec("INSERT OR IGNORE INTO photo_tags (photo_path, person_id) VALUES (?, ?)", filePath, personID)
+	_, err = db.Exec(`
+        INSERT OR IGNORE INTO photo_tags (photo_path, person_id) 
+        VALUES (?, ?)`, photoPath, personID)
 	if err != nil {
-		return fmt.Errorf("tagging photo %s with person %d: %v", filePath, personID, err)
+		return fmt.Errorf("tagging photo %s with person %d: %v", photoPath, personID, err)
 	}
 
-	log.Printf("Tagged %s with person %s (ID: %d)", filePath, personName, personID)
-
-	// Handle alias if present (e.g., "Kalena-A")
-	re := regexp.MustCompile(`(.+?)\s*\((.+?)\)`)
-	matches := re.FindStringSubmatch(strings.Split(galleryURL, "/threads/")[1])
-	if len(matches) >= 3 {
-		alias := strings.ReplaceAll(matches[2], "-", " ")
-		alias = strings.TrimSpace(alias)
-		if alias != "" && alias != personName {
-			var aliasID int
-			err = db.QueryRow("SELECT id FROM people WHERE name = ?", alias).Scan(&aliasID)
-			if err == sql.ErrNoRows {
-				res, err := db.Exec("INSERT INTO people (name) VALUES (?)", alias)
-				if err != nil {
-					return fmt.Errorf("inserting alias %s: %v", alias, err)
-				}
-				id, _ := res.LastInsertId()
-				aliasID = int(id)
-			}
-			_, err = db.Exec("INSERT OR IGNORE INTO photo_tags (photo_path, person_id) VALUES (?, ?)", filePath, aliasID)
-			if err != nil {
-				return fmt.Errorf("tagging photo %s with alias %d: %v", filePath, aliasID, err)
-			}
-			log.Printf("Tagged %s with alias %s (ID: %d)", filePath, alias, aliasID)
-		}
-	}
-
+	log.Printf("Tagged %s with person %s (ID: %d) from gallery %s", photoPath, name, personID, galleryURL)
 	return nil
 }
 
@@ -275,61 +254,89 @@ func extractPersonNameFromURL(url string) string {
 	// Extract thread part
 	parts := strings.Split(url, "/threads/")
 	if len(parts) < 2 {
+		log.Printf("URL %s has no thread part", url)
 		return ""
 	}
 	thread := parts[1]
+	if strings.Contains(thread, "?") {
+		thread = strings.Split(thread, "?")[0]
+	}
+	log.Printf("Thread: %s", thread)
 
-	// Split by "-" and handle thread ID
+	// Split by "-"
 	segments := strings.Split(thread, "-")
 	if len(segments) < 3 {
+		log.Printf("URL %s has too few segments: %v", url, segments)
 		return ""
 	}
+	log.Printf("Segments: %v", segments)
 
-	// Join segments up to the first non-prefix part to handle multi-part prefixes like "MetArt-com"
-	prefixEnd := 1
+	// Skip thread ID and prefixes
+	startIdx := 1
+	knownPrefixes := map[string]bool{
+		"metart":     true,
+		"metart-com": true,
+		"studio":     true,
+	}
 	for i := 1; i < len(segments); i++ {
-		if strings.HasSuffix(strings.ToLower(segments[i]), "com") || strings.ToLower(segments[i]) == "metart" {
-			prefixEnd = i + 1
+		lowerSeg := strings.ToLower(segments[i])
+		if knownPrefixes[lowerSeg] || strings.HasSuffix(lowerSeg, "com") {
+			startIdx = i + 1
 		} else {
 			break
 		}
 	}
+	log.Printf("Name search starts at index %d (%s)", startIdx, segments[startIdx-1])
 
-	// Collect name parts until gallery details
+	// Collect name parts (max 2 words)
 	var nameParts []string
-	for i := prefixEnd; i < len(segments); i++ {
+	for i := startIdx; i < len(segments) && len(nameParts) < 2; i++ {
 		segment := segments[i]
-		// Stop at gallery details: resolution, count, or parenthetical date
-		if regexp.MustCompile(`^\d+x\d+$`).MatchString(segment) || // e.g., "3148x4720"
+		lowerSeg := strings.ToLower(segment)
+
+		// Early rejection: any segment with numbers
+		if regexp.MustCompile(`\d`).MatchString(segment) {
+			log.Printf("Segment %s (index %d) rejected: contains numbers", segment, i)
+			break
+		}
+
+		// Stop at gallery details, metadata, or date indicators
+		if regexp.MustCompile(`^\d+x\d+$`).MatchString(segment) || // e.g., "6000px"
 			regexp.MustCompile(`^x\d+$`).MatchString(segment) || // e.g., "x130"
-			strings.Contains(segment, "(") || // e.g., "(Jan-27-2024)"
-			(i > prefixEnd && regexp.MustCompile(`^[A-Z][a-z]+$`).MatchString(segment)) { // e.g., "Flirty"
+			strings.Contains(segment, "(") || // e.g., "(Jan"
+			lowerSeg == "pictures" || lowerSeg == "px" || // e.g., "pictures"
+			(i > startIdx && regexp.MustCompile(`^[A-Z][a-z]+$`).MatchString(segment)) { // e.g., "Flirty"
+			log.Printf("Stopping at segment %s (index %d)", segment, i)
 			break
 		}
 		nameParts = append(nameParts, segment)
 	}
 
 	if len(nameParts) == 0 {
+		log.Printf("No name parts found in %s after index %d", url, startIdx)
 		return ""
 	}
+	log.Printf("Name parts: %v", nameParts)
 
 	// Join and clean name
 	name := strings.Join(nameParts, " ")
 	name = strings.ReplaceAll(name, "-", " ")
 	name = strings.TrimSpace(name)
+	log.Printf("Candidate name: %s", name)
 
-	// Handle aliases in parentheses if they appear early
-	re := regexp.MustCompile(`(.+?)\s*\((.+?)\)`)
-	matches := re.FindStringSubmatch(name)
-	if len(matches) >= 2 {
-		name = matches[1]
-	}
-
-	// Validate: letters and spaces only
-	if !regexp.MustCompile(`^[a-zA-Z\s]+$`).MatchString(name) {
+	// Double-check: reject if it contains any numbers
+	if regexp.MustCompile(`\d`).MatchString(name) {
+		log.Printf("Candidate %s rejected: contains numbers", name)
 		return ""
 	}
 
+	// Validate: letters only
+	if !regexp.MustCompile(`^[a-zA-Z\s]+$`).MatchString(name) {
+		log.Printf("Name %s rejected: contains invalid characters", name)
+		return ""
+	}
+
+	log.Printf("Final name for %s: %s", url, name)
 	return name
 }
 
