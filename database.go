@@ -41,7 +41,9 @@ func initDB() *sql.DB {
         );
         CREATE TABLE IF NOT EXISTS people (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE
+            name TEXT UNIQUE,
+            profile_photo_path TEXT,
+            FOREIGN KEY (profile_photo_path) REFERENCES photos(file_path)
         );
         CREATE TABLE IF NOT EXISTS photo_tags (
             photo_path TEXT,
@@ -55,10 +57,17 @@ func initDB() *sql.DB {
             color_hex TEXT,
             FOREIGN KEY (photo_path) REFERENCES photos(file_path),
             PRIMARY KEY (photo_path, color_hex)
+        );
+        CREATE TABLE IF NOT EXISTS aliases (
+            person_id INTEGER,
+            alias TEXT,
+            FOREIGN KEY (person_id) REFERENCES people(id),
+            PRIMARY KEY (person_id, alias)
         )`)
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	return db
 }
 

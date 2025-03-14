@@ -53,6 +53,12 @@ func main() {
 	r.Static("/images", "./downloads")
 	r.POST("/download", queueDownloads)
 	r.GET("/photos", listPhotos)
+	r.GET("/people", listPeople)
+	r.POST("/people/combine", combinePeople)
+	r.GET("/people/:id/photos", listPersonPhotos)
+	r.POST("/people/:id/alias", addAlias)
+	r.POST("/people/:id/profile-photo", setProfilePhoto)
+	r.GET("/galleries", listGalleries)
 	r.GET("/ws", handleWebSocket)
 
 	log.Fatal(r.Run(":8080"))
@@ -416,6 +422,210 @@ func listPhotos(c *gin.Context) {
 		"per_page":    perPageStr,
 		"total_pages": (total + perPage - 1) / perPage,
 	})
+}
+
+func listPeople(c *gin.Context) {
+	var people []struct {
+		ID               int      `json:"id"`
+		Name             string   `json:"name"`
+		ProfilePhotoPath string   `json:"profilePhotoPath"`
+		PhotoCount       int      `json:"photoCount"`
+		Aliases          []string `json:"aliases"`
+	}
+	rows, err := db.Query(`
+        SELECT p.id, p.name, 
+               COALESCE(p.profile_photo_path, '') as profile_photo_path, 
+               COUNT(pt.photo_path) as photo_count, 
+               GROUP_CONCAT(a.alias, ',') as aliases
+        FROM people p
+        LEFT JOIN photo_tags pt ON p.id = pt.person_id
+        LEFT JOIN aliases a ON p.id = a.person_id
+        GROUP BY p.id, p.name, p.profile_photo_path
+        ORDER BY p.name`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var p struct {
+			ID               int      `json:"id"`
+			Name             string   `json:"name"`
+			ProfilePhotoPath string   `json:"profilePhotoPath"`
+			PhotoCount       int      `json:"photoCount"`
+			Aliases          []string `json:"aliases"`
+		}
+		var aliases sql.NullString
+		if err := rows.Scan(&p.ID, &p.Name, &p.ProfilePhotoPath, &p.PhotoCount, &aliases); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if aliases.Valid {
+			p.Aliases = strings.Split(aliases.String, ",")
+		}
+		people = append(people, p)
+	}
+	c.JSON(http.StatusOK, people)
+}
+
+func listPersonPhotos(c *gin.Context) {
+	personID, _ := strconv.Atoi(c.Param("id"))
+	var photos []Photo
+	rows, err := db.Query(`
+        SELECT p.request_id, p.url, p.file_path, p.thumbnail_path, p.created_at
+        FROM photos p
+        JOIN photo_tags pt ON p.file_path = pt.photo_path
+        WHERE pt.person_id = ?
+        ORDER BY p.created_at DESC`, personID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var p Photo
+		if err := rows.Scan(&p.RequestID, &p.URL, &p.Path, &p.Thumbnail, &p.CreatedAt); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		photos = append(photos, p)
+	}
+	c.JSON(http.StatusOK, photos)
+}
+
+func combinePeople(c *gin.Context) {
+	type CombineRequest struct {
+		KeepID   int `json:"keepId"`
+		DeleteID int `json:"deleteId"`
+	}
+	var req CombineRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback()
+
+	// Reassign tags
+	_, err = tx.Exec(`
+        UPDATE photo_tags 
+        SET person_id = ? 
+        WHERE person_id = ?`, req.KeepID, req.DeleteID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Reassign aliases
+	_, err = tx.Exec(`
+        INSERT OR IGNORE INTO aliases (person_id, alias)
+        SELECT ?, alias FROM aliases WHERE person_id = ?`, req.KeepID, req.DeleteID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	_, err = tx.Exec("DELETE FROM aliases WHERE person_id = ?", req.DeleteID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Delete old person
+	_, err = tx.Exec("DELETE FROM people WHERE id = ?", req.DeleteID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "People combined successfully"})
+}
+
+func addAlias(c *gin.Context) {
+	personID, _ := strconv.Atoi(c.Param("id"))
+	type AliasRequest struct {
+		Alias string `json:"alias"`
+	}
+	var req AliasRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	_, err := db.Exec("INSERT OR IGNORE INTO aliases (person_id, alias) VALUES (?, ?)", personID, req.Alias)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Alias added successfully"})
+}
+
+func setProfilePhoto(c *gin.Context) {
+	personID, _ := strconv.Atoi(c.Param("id"))
+	type PhotoRequest struct {
+		PhotoPath string `json:"photoPath"`
+	}
+	var req PhotoRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Verify photo exists and is tagged with this person
+	var count int
+	err := db.QueryRow(`
+        SELECT COUNT(*) 
+        FROM photo_tags 
+        WHERE photo_path = ? AND person_id = ?`, req.PhotoPath, personID).Scan(&count)
+	if err != nil || count == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Photo not found or not tagged with this person"})
+		return
+	}
+
+	_, err = db.Exec("UPDATE people SET profile_photo_path = ? WHERE id = ?", req.PhotoPath, personID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Profile photo updated"})
+}
+
+func listGalleries(c *gin.Context) {
+	var galleries []struct {
+		ID        int    `json:"id"`
+		URL       string `json:"url"`
+		CreatedAt string `json:"createdAt"`
+	}
+	rows, err := db.Query("SELECT id, url, created_at FROM requests ORDER BY created_at DESC")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var g struct {
+			ID        int    `json:"id"`
+			URL       string `json:"url"`
+			CreatedAt string `json:"createdAt"`
+		}
+		if err := rows.Scan(&g.ID, &g.URL, &g.CreatedAt); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		galleries = append(galleries, g)
+	}
+	c.JSON(http.StatusOK, galleries)
 }
 
 func handleWebSocket(c *gin.Context) {
