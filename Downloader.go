@@ -15,12 +15,6 @@ import (
 	"github.com/disintegration/imaging"
 )
 
-type Photo struct {
-	URL       string
-	Path      string
-	Thumbnail string
-}
-
 func DownloadGallery(requestURL, targetUrl, title string) error {
 	fmt.Printf("Starting DownloadGallery for %s (title: %s)\n", targetUrl, title)
 
@@ -48,9 +42,9 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
 
 	cookies := []*http.Cookie{
-		{Name: "__ddg1_", Value: "M7tOoFMNZ5CPYPDwOMe7"},
-		{Name: "vg_sessionhash", Value: "b6d023161801c3dd47fd3fda1016704d"},
-		{Name: "vg_lastvisit", Value: "1741983944"},
+		{Name: "__ddg1_", Value: "7eINZVNMwVJGndautWZ4"},
+		{Name: "vg_sessionhash", Value: "88e351d68b07b3b2e749a03ea20aecc9"},
+		{Name: "vg_lastvisit", Value: "1741987802"},
 		{Name: "vg_lastactivity", Value: "0"},
 	}
 	for _, cookie := range cookies {
@@ -203,43 +197,19 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 				filename := path.Base(imageURL)
 				filepath := fmt.Sprintf("%s/%s", directory, filename)
 				thumbnailPath := fmt.Sprintf("%s/thumb_%s", thumbnailDir, filename)
-				fmt.Printf("Preparing to download %s to %s\n", imageURL, filepath)
 				if _, err := os.Stat(filepath); os.IsNotExist(err) {
 					if err := DownloadFile(imageURL, filepath); err != nil {
 						fmt.Printf("Error downloading %s: %v\n", imageURL, err)
 					} else {
-						fmt.Printf("Successfully downloaded %s to %s\n", imageURL, filepath)
 						if err := generateThumbnail(filepath, thumbnailPath); err != nil {
-							fmt.Printf("Error generating thumbnail for %s: %v\n", filepath, err)
+							fmt.Printf("Error generating thumbnail: %v\n", err)
 						} else {
-							fmt.Printf("Thumbnail generated at %s\n", thumbnailPath)
-							// Store photo immediately
 							if err := storePhoto(requestURL, imageURL, filepath, thumbnailPath); err != nil {
-								fmt.Printf("Failed to store photo %s: %v\n", imageURL, err)
+								fmt.Printf("Failed to store photo: %v\n", err)
 							}
-						}
-					}
-				} else {
-					fmt.Printf("File %s already exists, checking thumbnail\n", filepath)
-					if _, err := os.Stat(thumbnailPath); os.IsNotExist(err) {
-						if err := generateThumbnail(filepath, thumbnailPath); err != nil {
-							fmt.Printf("Error generating thumbnail for %s: %v\n", filepath, err)
-						} else {
-							fmt.Printf("Thumbnail generated at %s\n", thumbnailPath)
-							// Store photo if not already stored
-							if err := storePhoto(requestURL, imageURL, filepath, thumbnailPath); err != nil {
-								fmt.Printf("Failed to store photo %s: %v\n", imageURL, err)
-							}
-						}
-					} else {
-						// Store photo if not already stored (in case it was downloaded but not stored)
-						if err := storePhoto(requestURL, imageURL, filepath, thumbnailPath); err != nil {
-							fmt.Printf("Failed to store photo %s: %v\n", imageURL, err)
 						}
 					}
 				}
-			} else {
-				fmt.Printf("No image URL extracted for %s\n", src)
 			}
 		})
 		isFirstMatch = false

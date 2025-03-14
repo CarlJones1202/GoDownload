@@ -3,21 +3,28 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	"strconv"
+	"log"
 
 	_ "modernc.org/sqlite"
 )
 
+type Photo struct {
+	RequestID int
+	URL       string
+	Path      string
+	Thumbnail string
+	CreatedAt string
+}
+
 var db *sql.DB
 
-func initDB() error {
+func initDB() *sql.DB {
 	var err error
-	db, err = sql.Open("sqlite", "./downloads.db")
+	db, err = sql.Open("sqlite", "./gallery.db")
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
 
-	// Updated table schema with thumbnail_path
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS requests (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,66 +41,38 @@ func initDB() error {
 			FOREIGN KEY (request_id) REFERENCES requests(id)
 		);
 	`)
-	return err
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return db
 }
 
-func storeRequest(url string) error {
-	_, err := db.Exec("INSERT OR IGNORE INTO requests (url) VALUES (?)", url)
-	return err
-}
 func storePhoto(requestURL, photoURL, filePath, thumbnailPath string) error {
 	var requestID int
 	err := db.QueryRow("SELECT id FROM requests WHERE url = ?", requestURL).Scan(&requestID)
-	if err != nil {
-		return fmt.Errorf("getting request ID for %s: %v", requestURL, err)
-	}
-	_, err = db.Exec("INSERT INTO photos (request_id, url, file_path, thumbnail_path) VALUES (?, ?, ?, ?)",
-		requestID, photoURL, filePath, thumbnailPath)
-	return err
-}
-
-func getPhotos(page, perPage string) ([]map[string]string, int64, error) {
-	p, err := strconv.Atoi(page)
-	if err != nil || p < 1 {
-		p = 1
-	}
-	pp, err := strconv.Atoi(perPage)
-	if err != nil || pp < 1 {
-		pp = 10
-	}
-
-	offset := (p - 1) * pp
-
-	var total int64
-	err = db.QueryRow("SELECT COUNT(*) FROM photos").Scan(&total)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	rows, err := db.Query(`
-		SELECT r.url AS request_url, p.url, p.file_path, p.thumbnail_path, p.created_at 
-		FROM photos p 
-		JOIN requests r ON p.request_id = r.id 
-		ORDER BY p.created_at DESC 
-		LIMIT ? OFFSET ?`, pp, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	var photos []map[string]string
-	for rows.Next() {
-		var reqURL, url, filePath, thumbnailPath, createdAt string
-		if err := rows.Scan(&reqURL, &url, &filePath, &thumbnailPath, &createdAt); err != nil {
-			return nil, 0, err
+	if err == sql.ErrNoRows {
+		result, err := db.Exec("INSERT INTO requests (url) VALUES (?)", requestURL)
+		if err != nil {
+			return fmt.Errorf("inserting request %s: %v", requestURL, err)
 		}
-		photos = append(photos, map[string]string{
-			"request_url":    reqURL,
-			"url":            url,
-			"file_path":      filePath,
-			"thumbnail_path": thumbnailPath,
-			"created_at":     createdAt,
-		})
+		id, err := result.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("getting request ID: %v", err)
+		}
+		requestID = int(id)
+	} else if err != nil {
+		return fmt.Errorf("querying request %s: %v", requestURL, err)
 	}
-	return photos, total, nil
+
+	_, err = db.Exec(`
+		INSERT INTO photos (request_id, url, file_path, thumbnail_path) 
+		VALUES (?, ?, ?, ?)`,
+		requestID, photoURL, filePath, thumbnailPath)
+	if err != nil {
+		return fmt.Errorf("inserting photo %s: %v", photoURL, err)
+	}
+
+	broadcastNewPhoto()
+	return nil
 }
