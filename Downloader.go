@@ -12,16 +12,16 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/gocolly/colly/v2"
+	"github.com/disintegration/imaging"
 )
 
-// Photo struct to track downloaded images
 type Photo struct {
-	URL  string
-	Path string
+	URL       string
+	Path      string
+	Thumbnail string
 }
 
-func DownloadGallery(targetUrl, title string) ([]Photo, error) {
+func DownloadGallery(requestURL, targetUrl, title string) error {
 	fmt.Printf("Starting DownloadGallery for %s (title: %s)\n", targetUrl, title)
 
 	client := &http.Client{
@@ -40,18 +40,17 @@ func DownloadGallery(targetUrl, title string) ([]Photo, error) {
 	}
 	req, err := http.NewRequest("GET", targetUrl, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating request for %s: %v", targetUrl, err)
+		return fmt.Errorf("creating request for %s: %v", targetUrl, err)
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0")
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
 
-	// Replace with your browser cookies
 	cookies := []*http.Cookie{
-		{Name: "__ddg1_", Value: "KVE0fOPFuJNqdTMr0cHO"},
-		{Name: "vg_sessionhash", Value: "aaa1f6329b0deedcf1a37426461c7f42"},
-		{Name: "vg_lastvisit", Value: "1741980671"},
+		{Name: "__ddg1_", Value: "M7tOoFMNZ5CPYPDwOMe7"},
+		{Name: "vg_sessionhash", Value: "b6d023161801c3dd47fd3fda1016704d"},
+		{Name: "vg_lastvisit", Value: "1741983944"},
 		{Name: "vg_lastactivity", Value: "0"},
 	}
 	for _, cookie := range cookies {
@@ -66,7 +65,7 @@ func DownloadGallery(targetUrl, title string) ([]Photo, error) {
 		if err != nil {
 			fmt.Printf("Request failed: %v\n", err)
 			if attempt == maxRetries {
-				return nil, fmt.Errorf("fetching %s after %d attempts: %v", targetUrl, maxRetries, err)
+				return fmt.Errorf("fetching %s after %d attempts: %v", targetUrl, maxRetries, err)
 			}
 			time.Sleep(5 * time.Second)
 			continue
@@ -74,7 +73,7 @@ func DownloadGallery(targetUrl, title string) ([]Photo, error) {
 		break
 	}
 	if resp == nil {
-		return nil, fmt.Errorf("no response received for %s after %d attempts", targetUrl, maxRetries)
+		return fmt.Errorf("no response received for %s after %d attempts", targetUrl, maxRetries)
 	}
 	defer resp.Body.Close()
 
@@ -90,12 +89,12 @@ func DownloadGallery(targetUrl, title string) ([]Photo, error) {
 		} else {
 			fmt.Println("Saved response body to response.html")
 		}
-		return nil, fmt.Errorf("unexpected status %d for %s", resp.StatusCode, targetUrl)
+		return fmt.Errorf("unexpected status %d for %s", resp.StatusCode, targetUrl)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading response body: %v", err)
+		return fmt.Errorf("reading response body: %v", err)
 	}
 	if strings.Contains(string(body), "DDoS-Guard") || strings.Contains(string(body), "Checking your browser") {
 		fmt.Println("DDoS-Guard protection detected. Please update cookies from your browser.")
@@ -104,12 +103,12 @@ func DownloadGallery(targetUrl, title string) ([]Photo, error) {
 		} else {
 			fmt.Println("Saved DDoS-Guard response to response.html")
 		}
-		return nil, fmt.Errorf("blocked by DDoS-Guard; update cookies and retry")
+		return fmt.Errorf("blocked by DDoS-Guard; update cookies and retry")
 	}
 
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
 	if err != nil {
-		return nil, fmt.Errorf("parsing HTML from %s: %v", targetUrl, err)
+		return fmt.Errorf("parsing HTML from %s: %v", targetUrl, err)
 	}
 
 	tempTarget := targetUrl
@@ -120,7 +119,7 @@ func DownloadGallery(targetUrl, title string) ([]Photo, error) {
 
 	u, err := url.Parse(tempTarget)
 	if err != nil {
-		return nil, fmt.Errorf("parsing URL %s: %v", targetUrl, err)
+		return fmt.Errorf("parsing URL %s: %v", targetUrl, err)
 	}
 	u.RawQuery = ""
 	fmt.Printf("Parsed URL path: %s\n", u.Path)
@@ -138,11 +137,14 @@ func DownloadGallery(targetUrl, title string) ([]Photo, error) {
 	}
 	fmt.Printf("Creating directory: %s\n", directory)
 	if err := os.MkdirAll(directory, os.ModePerm); err != nil {
-		return nil, fmt.Errorf("creating directory %s: %v", directory, err)
+		return fmt.Errorf("creating directory %s: %v", directory, err)
 	}
-	fmt.Printf("Directory %s created or already exists\n", directory)
+	thumbnailDir := directory + "/thumbnails"
+	if err := os.MkdirAll(thumbnailDir, os.ModePerm); err != nil {
+		return fmt.Errorf("creating thumbnail directory %s: %v", thumbnailDir, err)
+	}
+	fmt.Printf("Directory %s and thumbnail dir %s created or already exist\n", directory, thumbnailDir)
 
-	var photos []Photo
 	isFirstMatch := true
 	doc.Find(fmt.Sprintf("div[id^='%s']", postId)).Each(func(_ int, s *goquery.Selection) {
 		if !isFirstMatch {
@@ -200,17 +202,41 @@ func DownloadGallery(targetUrl, title string) ([]Photo, error) {
 			if imageURL != "" {
 				filename := path.Base(imageURL)
 				filepath := fmt.Sprintf("%s/%s", directory, filename)
+				thumbnailPath := fmt.Sprintf("%s/thumb_%s", thumbnailDir, filename)
 				fmt.Printf("Preparing to download %s to %s\n", imageURL, filepath)
 				if _, err := os.Stat(filepath); os.IsNotExist(err) {
 					if err := DownloadFile(imageURL, filepath); err != nil {
 						fmt.Printf("Error downloading %s: %v\n", imageURL, err)
 					} else {
 						fmt.Printf("Successfully downloaded %s to %s\n", imageURL, filepath)
-						photos = append(photos, Photo{URL: imageURL, Path: filepath})
+						if err := generateThumbnail(filepath, thumbnailPath); err != nil {
+							fmt.Printf("Error generating thumbnail for %s: %v\n", filepath, err)
+						} else {
+							fmt.Printf("Thumbnail generated at %s\n", thumbnailPath)
+							// Store photo immediately
+							if err := storePhoto(requestURL, imageURL, filepath, thumbnailPath); err != nil {
+								fmt.Printf("Failed to store photo %s: %v\n", imageURL, err)
+							}
+						}
 					}
 				} else {
-					fmt.Printf("File %s already exists, skipping download\n", filepath)
-					photos = append(photos, Photo{URL: imageURL, Path: filepath})
+					fmt.Printf("File %s already exists, checking thumbnail\n", filepath)
+					if _, err := os.Stat(thumbnailPath); os.IsNotExist(err) {
+						if err := generateThumbnail(filepath, thumbnailPath); err != nil {
+							fmt.Printf("Error generating thumbnail for %s: %v\n", filepath, err)
+						} else {
+							fmt.Printf("Thumbnail generated at %s\n", thumbnailPath)
+							// Store photo if not already stored
+							if err := storePhoto(requestURL, imageURL, filepath, thumbnailPath); err != nil {
+								fmt.Printf("Failed to store photo %s: %v\n", imageURL, err)
+							}
+						}
+					} else {
+						// Store photo if not already stored (in case it was downloaded but not stored)
+						if err := storePhoto(requestURL, imageURL, filepath, thumbnailPath); err != nil {
+							fmt.Printf("Failed to store photo %s: %v\n", imageURL, err)
+						}
+					}
 				}
 			} else {
 				fmt.Printf("No image URL extracted for %s\n", src)
@@ -219,11 +245,20 @@ func DownloadGallery(targetUrl, title string) ([]Photo, error) {
 		isFirstMatch = false
 	})
 
-	fmt.Printf("Completed download for %s, found %d photos\n", targetUrl, len(photos))
-	return photos, nil
+	fmt.Printf("Completed processing for %s\n", targetUrl)
+	return nil
 }
 
-func newCollector() *colly.Collector {
-	fmt.Println("Creating new Colly collector")
-	return colly.NewCollector()
+func generateThumbnail(srcPath, destPath string) error {
+	img, err := imaging.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("opening image %s: %v", srcPath, err)
+	}
+
+	// Resize to width 200, maintaining aspect ratio
+	thumb := imaging.Resize(img, 200, 0, imaging.Lanczos)
+	if err := imaging.Save(thumb, destPath); err != nil {
+		return fmt.Errorf("saving thumbnail %s: %v", destPath, err)
+	}
+	return nil
 }

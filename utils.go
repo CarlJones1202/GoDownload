@@ -7,6 +7,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	"github.com/gocolly/colly/v2"
 )
 
 func sanitizeFolderName(name string) string {
@@ -44,4 +46,9 @@ func DownloadFile(url, filepath string) error {
 	}
 	fmt.Printf("Completed writing to %s\n", filepath)
 	return nil
+}
+
+func newCollector() *colly.Collector {
+	fmt.Println("Creating new Colly collector")
+	return colly.NewCollector()
 }

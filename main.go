@@ -29,11 +29,10 @@ func main() {
 
 	r := gin.Default()
 
+	r.Static("/images", "./downloads")
+
 	// Add CORS middleware
 	r.Use(corsMiddleware())
-
-	// Serve the downloads directory
-	r.Static("/files", "./downloads")
 
 	r.POST("/download", queueDownloads)
 	r.GET("/photos", listPhotos)
@@ -43,11 +42,13 @@ func main() {
 	}
 }
 
+// CORS middleware to allow requests from http://localhost:3000
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		// Handle preflight OPTIONS request
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
@@ -88,14 +89,9 @@ func queueDownloads(c *gin.Context) {
 }
 
 func processURL(url string) error {
-	photos, err := DownloadGallery(url, "")
-	if err != nil {
-		return err
-	}
-	for _, photo := range photos {
-		if err := storePhoto(url, photo.URL, photo.Path); err != nil {
-			fmt.Printf("Failed to store photo %s: %v\n", photo.URL, err)
-		}
+	fmt.Printf("Processing URL: %s\n", url)
+	if err := DownloadGallery(url, url, ""); err != nil {
+		return fmt.Errorf("error downloading gallery %s: %v", url, err)
 	}
 	return nil
 }
