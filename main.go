@@ -58,54 +58,72 @@ func taggingService() {
 	for {
 		// Fetch untagged photos
 		rows, err := db.Query(`
-            SELECT file_path, url 
-            FROM photos 
-            WHERE file_path NOT IN (SELECT photo_path FROM photo_tags) 
-            LIMIT 10`)
+			SELECT p.file_path, r.url 
+			FROM photos p 
+			JOIN requests r ON p.request_id = r.id 
+			WHERE p.file_path NOT IN (SELECT photo_path FROM photo_tags) 
+			LIMIT 10`)
 		if err != nil {
 			log.Printf("Error querying untagged photos: %v", err)
 			time.Sleep(10 * time.Second)
 			continue
 		}
 
+		// Queue all fetched photos
+		photoCount := 0
 		for rows.Next() {
-			var filePath, url string
-			if err := rows.Scan(&filePath, &url); err != nil {
+			var filePath, galleryURL string
+			if err := rows.Scan(&filePath, &galleryURL); err != nil {
 				log.Printf("Error scanning photo: %v", err)
 				continue
 			}
-			photoChan <- filePath // Queue for processing
+			photoChan <- filePath
+			photoCount++
 		}
 		rows.Close()
 
-		// Process queued photos
-		select {
-		case photoPath := <-photoChan:
-			if err := processPhotoForTagging(photoPath); err != nil {
-				log.Printf("Error processing photo %s: %v", photoPath, err)
+		// Process all queued photos in this batch
+		for i := 0; i < photoCount; i++ {
+			select {
+			case photoPath := <-photoChan:
+				if err := processPhotoForTagging(photoPath); err != nil {
+					log.Printf("Error processing photo %s: %v", photoPath, err)
+				}
+			default:
+				// If channel is empty prematurely, break out
+				log.Printf("Channel empty before processing all %d photos", photoCount)
+				break
 			}
-		default:
-			time.Sleep(10 * time.Second) // Wait if no photos
+		}
+
+		// If no photos were queued, wait before checking again
+		if photoCount == 0 {
+			log.Printf("No untagged photos found, waiting...")
+			time.Sleep(10 * time.Second)
+		} else {
+			time.Sleep(2 * time.Second)
 		}
 	}
 }
 
 // Placeholder for photo processing and tagging
 func processPhotoForTagging(filePath string) error {
-	// Fetch the URL for this photo
-	var url string
-	err := db.QueryRow("SELECT url FROM photos WHERE file_path = ?", filePath).Scan(&url)
+	var galleryURL string
+	err := db.QueryRow(`
+        SELECT r.url 
+        FROM photos p 
+        JOIN requests r ON p.request_id = r.id 
+        WHERE p.file_path = ?`, filePath).Scan(&galleryURL)
 	if err != nil {
-		return fmt.Errorf("fetching URL for %s: %v", filePath, err)
+		return fmt.Errorf("fetching gallery URL for %s: %v", filePath, err)
 	}
 
-	// Simulate face recognition (replace with real service)
-	personName := extractPersonNameFromURL(url) // Custom logic
+	personName := extractPersonNameFromURL(galleryURL)
 	if personName == "" {
-		return nil // No person identified
+		return nil
 	}
 
-	// Get or create person ID
+	// Handle main name
 	var personID int
 	err = db.QueryRow("SELECT id FROM people WHERE name = ?", personName).Scan(&personID)
 	if err == sql.ErrNoRows {
@@ -119,17 +137,41 @@ func processPhotoForTagging(filePath string) error {
 		return fmt.Errorf("querying person %s: %v", personName, err)
 	}
 
-	// Tag the photo
 	_, err = db.Exec("INSERT OR IGNORE INTO photo_tags (photo_path, person_id) VALUES (?, ?)", filePath, personID)
 	if err != nil {
 		return fmt.Errorf("tagging photo %s with person %d: %v", filePath, personID, err)
 	}
 
 	log.Printf("Tagged %s with person %s (ID: %d)", filePath, personName, personID)
+
+	// Handle alias if present (e.g., "Kalena-A")
+	re := regexp.MustCompile(`(.+?)\s*\((.+?)\)`)
+	matches := re.FindStringSubmatch(strings.Split(galleryURL, "/threads/")[1])
+	if len(matches) >= 3 {
+		alias := strings.ReplaceAll(matches[2], "-", " ")
+		alias = strings.TrimSpace(alias)
+		if alias != "" && alias != personName {
+			var aliasID int
+			err = db.QueryRow("SELECT id FROM people WHERE name = ?", alias).Scan(&aliasID)
+			if err == sql.ErrNoRows {
+				res, err := db.Exec("INSERT INTO people (name) VALUES (?)", alias)
+				if err != nil {
+					return fmt.Errorf("inserting alias %s: %v", alias, err)
+				}
+				id, _ := res.LastInsertId()
+				aliasID = int(id)
+			}
+			_, err = db.Exec("INSERT OR IGNORE INTO photo_tags (photo_path, person_id) VALUES (?, ?)", filePath, aliasID)
+			if err != nil {
+				return fmt.Errorf("tagging photo %s with alias %d: %v", filePath, aliasID, err)
+			}
+			log.Printf("Tagged %s with alias %s (ID: %d)", filePath, alias, aliasID)
+		}
+	}
+
 	return nil
 }
 
-// extractPersonNameFromURL extracts the person's name from a vipergirls.to thread URL
 func extractPersonNameFromURL(url string) string {
 	// Extract the thread part after "threads/"
 	parts := strings.Split(url, "/threads/")
@@ -140,26 +182,53 @@ func extractPersonNameFromURL(url string) string {
 
 	// Split by "-" and skip the numeric thread ID
 	segments := strings.Split(thread, "-")
-	if len(segments) < 2 {
+	if len(segments) < 3 { // Need at least ID, prefix/site, and name
 		return ""
 	}
 
-	// The name is typically the first segment after the ID
-	name := segments[1]
+	// Skip known site prefixes
+	knownPrefixes := map[string]bool{
+		"MetArt":     true,
+		"MetArt-com": true,
+		// Add more prefixes as needed (e.g., "Studio", "Playboy")
+	}
 
-	// Handle cases with aliases in parentheses (e.g., "Michaela-Isizzu-(Kalena-A)")
+	// Start after the thread ID (segments[0] is the ID)
+	nameStartIdx := 1
+	if knownPrefixes[segments[1]] || strings.HasSuffix(segments[1], "com") {
+		nameStartIdx = 2 // Skip prefix like "MetArt-com"
+	}
+
+	// Collect name segments until we hit gallery details (e.g., resolution, date, or "x[digits]")
+	var nameParts []string
+	for i := nameStartIdx; i < len(segments); i++ {
+		segment := segments[i]
+		// Stop at gallery details: resolution (e.g., "3148x4720"), count (e.g., "x130"), or date (e.g., "(Jan-27-2024)")
+		if regexp.MustCompile(`^\d+x\d+$`).MatchString(segment) || // e.g., "3148x4720"
+			regexp.MustCompile(`^x\d+$`).MatchString(segment) || // e.g., "x130"
+			strings.Contains(segment, "(") { // e.g., "(Jan-27-2024)"
+			break
+		}
+		nameParts = append(nameParts, segment)
+	}
+
+	if len(nameParts) == 0 {
+		return ""
+	}
+
+	// Join name parts and clean up
+	name := strings.Join(nameParts, " ")
+	name = strings.ReplaceAll(name, "-", " ") // Handle "Azzurra-Moretti" -> "Azzurra Moretti"
+	name = strings.TrimSpace(name)
+
+	// Handle aliases in parentheses if they appear in the name segment
 	re := regexp.MustCompile(`(.+?)\s*\((.+?)\)`)
 	matches := re.FindStringSubmatch(name)
 	if len(matches) >= 2 {
-		name = matches[1] // Use the main name before parentheses
-		// Optionally, you could store matches[2] (e.g., "Kalena-A") as an alias
+		name = matches[1] // Take primary name before parentheses
 	}
 
-	// Clean up: replace hyphens with spaces and trim
-	name = strings.ReplaceAll(name, "-", " ")
-	name = strings.TrimSpace(name)
-
-	// Basic validation: ensure it looks like a name (letters, spaces, maybe numbers)
+	// Validate: ensure it looks like a name (letters and spaces)
 	if !regexp.MustCompile(`^[a-zA-Z\s]+$`).MatchString(name) {
 		return ""
 	}
@@ -201,12 +270,12 @@ func listPhotos(c *gin.Context) {
 	}
 
 	type PhotoWithTags struct {
-		RequestID int      `json:"request_id"`
-		URL       string   `json:"url"`
-		Path      string   `json:"file_path"`
-		Thumbnail string   `json:"thumbnail_path"`
-		CreatedAt string   `json:"created_at"`
-		Tags      []string `json:"tags"`
+		RequestID int      `json:"RequestId"`
+		URL       string   `json:"URL"`
+		Path      string   `json:"Path"`
+		Thumbnail string   `json:"Thumbnail"`
+		CreatedAt string   `json:"CreatedAt"`
+		Tags      []string `json:"Tags"`
 	}
 
 	var photos []PhotoWithTags
