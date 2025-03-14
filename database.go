@@ -45,6 +45,29 @@ func initDB() *sql.DB {
 		log.Fatal(err)
 	}
 
+	// New people table: unique ID and name
+	_, err = db.Exec(`
+	CREATE TABLE IF NOT EXISTS people (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT UNIQUE
+	)`)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// New photo_tags table: links photos to people
+	_, err = db.Exec(`
+	CREATE TABLE IF NOT EXISTS photo_tags (
+		photo_path TEXT,
+		person_id INTEGER,
+		FOREIGN KEY (photo_path) REFERENCES photos(file_path),
+		FOREIGN KEY (person_id) REFERENCES people(id),
+		PRIMARY KEY (photo_path, person_id)
+	)`)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	return db
 }
 
