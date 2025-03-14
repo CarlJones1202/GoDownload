@@ -2,9 +2,11 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path"
@@ -13,43 +15,106 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/disintegration/imaging"
+	"golang.org/x/net/publicsuffix"
 )
+
+var (
+	cookieFile = "cookies.json"
+	jar        *cookiejar.Jar
+)
+
+func init() {
+	// Initialize cookie jar
+	var err error
+	jar, err = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if err != nil {
+		fmt.Printf("Failed to initialize cookie jar: %v\n", err)
+	}
+	loadCookies()
+}
+
+// Load cookies from file
+func loadCookies() {
+	data, err := os.ReadFile(cookieFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Printf("Error reading cookie file: %v\n", err)
+		}
+		return
+	}
+	var cookies []*http.Cookie
+	if err := json.Unmarshal(data, &cookies); err != nil {
+		fmt.Printf("Error unmarshaling cookies: %v\n", err)
+		return
+	}
+	u, _ := url.Parse("https://vipergirls.to")
+	jar.SetCookies(u, cookies)
+}
+
+// Save cookies to file
+func saveCookies() {
+	u, _ := url.Parse("https://vipergirls.to")
+	cookies := jar.Cookies(u)
+	data, err := json.Marshal(cookies)
+	if err != nil {
+		fmt.Printf("Error marshaling cookies: %v\n", err)
+		return
+	}
+	if err := os.WriteFile(cookieFile, data, 0644); err != nil {
+		fmt.Printf("Error writing cookie file: %v\n", err)
+	}
+}
+
+// Refresh cookies from vipergirls.to
+func refreshCookies(client *http.Client) error {
+	req, err := http.NewRequest("GET", "https://vipergirls.to/", nil)
+	if err != nil {
+		return fmt.Errorf("creating refresh request: %v", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("refreshing cookies: %v", err)
+	}
+	defer resp.Body.Close()
+	saveCookies()
+	fmt.Println("Cookies refreshed from vipergirls.to")
+	return nil
+}
 
 func DownloadGallery(requestURL, targetUrl, title string) error {
 	fmt.Printf("Starting DownloadGallery for %s (title: %s)\n", targetUrl, title)
 
 	client := &http.Client{
-		Timeout: 60 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				MaxVersion: tls.VersionTLS13,
-			},
-			ForceAttemptHTTP2: true,
-		},
+		Timeout:   60 * time.Second,
+		Jar:       jar,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS13}},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			fmt.Printf("Redirecting to %s\n", req.URL.String())
 			return nil
 		},
 	}
+
+	// Refresh cookies if they're empty or expired
+	u, _ := url.Parse("https://vipergirls.to")
+	if len(jar.Cookies(u)) == 0 || time.Now().Sub(jar.Cookies(u)[0].Expires) > 0 {
+		if err := refreshCookies(client); err != nil {
+			return fmt.Errorf("failed to refresh cookies: %v", err)
+		}
+	}
+
 	req, err := http.NewRequest("GET", targetUrl, nil)
 	if err != nil {
 		return fmt.Errorf("creating request for %s: %v", targetUrl, err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0")
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
 
-	cookies := []*http.Cookie{
-		{Name: "__ddg1_", Value: "7eINZVNMwVJGndautWZ4"},
-		{Name: "vg_sessionhash", Value: "88e351d68b07b3b2e749a03ea20aecc9"},
-		{Name: "vg_lastvisit", Value: "1741987802"},
-		{Name: "vg_lastactivity", Value: "0"},
-	}
-	for _, cookie := range cookies {
-		req.AddCookie(cookie)
-	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Referer", "https://vipergirls.to/")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
 
 	maxRetries := 3
 	var resp *http.Response
@@ -71,18 +136,9 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 	}
 	defer resp.Body.Close()
 
-	fmt.Printf("HTTP response for %s: Status %d\n", targetUrl, resp.StatusCode)
 	if resp.StatusCode != 200 {
-		fmt.Printf("Non-200 status for %s: %d\n", targetUrl, resp.StatusCode)
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Printf("Error reading response body: %v\n", err)
-		}
-		if err := os.WriteFile("response.html", body, 0644); err != nil {
-			fmt.Printf("Error saving response body: %v\n", err)
-		} else {
-			fmt.Println("Saved response body to response.html")
-		}
+		body, _ := io.ReadAll(resp.Body)
+		os.WriteFile("response.html", body, 0644)
 		return fmt.Errorf("unexpected status %d for %s", resp.StatusCode, targetUrl)
 	}
 
@@ -91,13 +147,11 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 		return fmt.Errorf("reading response body: %v", err)
 	}
 	if strings.Contains(string(body), "DDoS-Guard") || strings.Contains(string(body), "Checking your browser") {
-		fmt.Println("DDoS-Guard protection detected. Please update cookies from your browser.")
-		if err := os.WriteFile("response.html", body, 0644); err != nil {
-			fmt.Printf("Error saving DDoS-Guard response: %v\n", err)
-		} else {
-			fmt.Println("Saved DDoS-Guard response to response.html")
+		fmt.Println("DDoS-Guard detected, refreshing cookies")
+		if err := refreshCookies(client); err != nil {
+			return fmt.Errorf("blocked by DDoS-Guard and failed to refresh cookies: %v", err)
 		}
-		return fmt.Errorf("blocked by DDoS-Guard; update cookies and retry")
+		return DownloadGallery(requestURL, targetUrl, title) // Retry with fresh cookies
 	}
 
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
@@ -111,7 +165,7 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 	}
 	fmt.Printf("Base target URL: %s\n", tempTarget)
 
-	u, err := url.Parse(tempTarget)
+	u, err = url.Parse(tempTarget)
 	if err != nil {
 		return fmt.Errorf("parsing URL %s: %v", targetUrl, err)
 	}
@@ -200,14 +254,10 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 				if _, err := os.Stat(filepath); os.IsNotExist(err) {
 					if err := DownloadFile(imageURL, filepath); err != nil {
 						fmt.Printf("Error downloading %s: %v\n", imageURL, err)
-					} else {
-						if err := generateThumbnail(filepath, thumbnailPath); err != nil {
-							fmt.Printf("Error generating thumbnail: %v\n", err)
-						} else {
-							if err := storePhoto(requestURL, imageURL, filepath, thumbnailPath); err != nil {
-								fmt.Printf("Failed to store photo: %v\n", err)
-							}
-						}
+					} else if err := generateThumbnail(filepath, thumbnailPath); err != nil {
+						fmt.Printf("Error generating thumbnail: %v\n", err)
+					} else if err := storePhoto(requestURL, imageURL, filepath, thumbnailPath); err != nil {
+						fmt.Printf("Failed to store photo: %v\n", err)
 					}
 				}
 			}
