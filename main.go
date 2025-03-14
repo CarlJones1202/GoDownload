@@ -12,8 +12,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/disintegration/imaging"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/lucasb-eyer/go-colorful"
+	"github.com/muesli/clusters"
+	"github.com/muesli/kmeans"
 	_ "modernc.org/sqlite"
 )
 
@@ -21,7 +25,8 @@ var (
 	downloadDir = "./downloads"
 	clients     = make(map[*websocket.Conn]bool)
 	clientsMu   sync.Mutex
-	photoChan   = make(chan string, 100) // Channel for photo paths to process
+	photoChan   = make(chan string, 100) // For tagging
+	colorChan   = make(chan string, 100) // For color extraction
 )
 
 var upgrader = websocket.Upgrader{
@@ -40,8 +45,8 @@ func main() {
 		log.Printf("Error checking/redownloading files: %v", err)
 	}
 
-	// Start background tagging service
 	go taggingService()
+	go colorExtractionService()
 
 	r := gin.Default()
 	r.Use(corsMiddleware())
@@ -51,6 +56,94 @@ func main() {
 	r.GET("/ws", handleWebSocket)
 
 	log.Fatal(r.Run(":8080"))
+}
+
+// New color extraction service
+func colorExtractionService() {
+	for {
+		rows, err := db.Query(`
+            SELECT file_path 
+            FROM photos 
+            WHERE file_path NOT IN (SELECT photo_path FROM photo_colors) 
+            LIMIT 10`)
+		if err != nil {
+			log.Printf("Error querying photos for color extraction: %v", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		photoCount := 0
+		for rows.Next() {
+			var filePath string
+			if err := rows.Scan(&filePath); err != nil {
+				log.Printf("Error scanning photo for color: %v", err)
+				continue
+			}
+			colorChan <- filePath
+			photoCount++
+		}
+		rows.Close()
+
+		for i := 0; i < photoCount; i++ {
+			select {
+			case photoPath := <-colorChan:
+				if err := extractAndStoreColors(photoPath); err != nil {
+					log.Printf("Error extracting colors for %s: %v", photoPath, err)
+				}
+			default:
+				log.Printf("Color channel empty before processing all %d photos", photoCount)
+				break
+			}
+		}
+
+		if photoCount == 0 {
+			log.Printf("No photos needing color extraction, waiting...")
+			time.Sleep(10 * time.Second)
+		}
+	}
+}
+
+// Extract dominant colors from an image and store them
+func extractAndStoreColors(filePath string) error {
+	// Load image
+	img, err := imaging.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("opening image %s: %v", filePath, err)
+	}
+
+	// Resize for faster processing
+	img = imaging.Resize(img, 100, 0, imaging.Lanczos)
+
+	// Convert pixels to colorful.Color
+	bounds := img.Bounds()
+	var observations clusters.Observations
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r, g, b, _ := img.At(x, y).RGBA()
+			c := colorful.Color{R: float64(r) / 65535.0, G: float64(g) / 65535.0, B: float64(b) / 65535.0}
+			observations = append(observations, clusters.Coordinates{c.R, c.G, c.B})
+		}
+	}
+
+	// Cluster colors using k-means (top 3 colors)
+	km := kmeans.New()
+	clusters, err := km.Partition(observations, 3)
+	if err != nil {
+		return fmt.Errorf("clustering colors: %v", err)
+	}
+
+	// Store the dominant colors
+	for _, cluster := range clusters {
+		center := cluster.Center
+		hex := colorful.Color{R: center[0], G: center[1], B: center[2]}.Hex()
+		_, err = db.Exec("INSERT OR IGNORE INTO photo_colors (photo_path, color_hex) VALUES (?, ?)", filePath, hex)
+		if err != nil {
+			return fmt.Errorf("storing color %s for %s: %v", hex, filePath, err)
+		}
+		log.Printf("Stored color %s for %s", hex, filePath)
+	}
+
+	return nil
 }
 
 // Background service to tag photos
@@ -269,21 +362,24 @@ func listPhotos(c *gin.Context) {
 		perPage = 50
 	}
 
-	type PhotoWithTags struct {
+	type PhotoWithTagsAndColors struct {
 		RequestID int      `json:"RequestId"`
 		URL       string   `json:"URL"`
 		Path      string   `json:"Path"`
 		Thumbnail string   `json:"Thumbnail"`
 		CreatedAt string   `json:"CreatedAt"`
 		Tags      []string `json:"Tags"`
+		Colors    []string `json:"Colors"`
 	}
 
-	var photos []PhotoWithTags
+	var photos []PhotoWithTagsAndColors
 	rows, err := db.Query(`
-        SELECT p.request_id, p.url, p.file_path, p.thumbnail_path, p.created_at, GROUP_CONCAT(pe.name, ',') 
+        SELECT p.request_id, p.url, p.file_path, p.thumbnail_path, p.created_at, 
+               GROUP_CONCAT(pe.name, ','), GROUP_CONCAT(pc.color_hex, ',') 
         FROM photos p 
         LEFT JOIN photo_tags pt ON p.file_path = pt.photo_path 
         LEFT JOIN people pe ON pt.person_id = pe.id 
+        LEFT JOIN photo_colors pc ON p.file_path = pc.photo_path 
         GROUP BY p.file_path 
         ORDER BY p.created_at DESC 
         LIMIT ? OFFSET ?`,
@@ -295,14 +391,17 @@ func listPhotos(c *gin.Context) {
 	defer rows.Close()
 
 	for rows.Next() {
-		var p PhotoWithTags
-		var tags sql.NullString
-		if err := rows.Scan(&p.RequestID, &p.URL, &p.Path, &p.Thumbnail, &p.CreatedAt, &tags); err != nil {
+		var p PhotoWithTagsAndColors
+		var tags, colors sql.NullString
+		if err := rows.Scan(&p.RequestID, &p.URL, &p.Path, &p.Thumbnail, &p.CreatedAt, &tags, &colors); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 		if tags.Valid {
 			p.Tags = strings.Split(tags.String, ",")
+		}
+		if colors.Valid {
+			p.Colors = strings.Split(colors.String, ",")
 		}
 		photos = append(photos, p)
 	}

@@ -19,55 +19,46 @@ type Photo struct {
 var db *sql.DB
 
 func initDB() *sql.DB {
-	var err error
-	db, err = sql.Open("sqlite", "./gallery.db")
+	db, err := sql.Open("sqlite", "./gallery.db")
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS requests (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			url TEXT UNIQUE,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-		);
-		CREATE TABLE IF NOT EXISTS photos (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			request_id INTEGER,
-			url TEXT,
-			file_path TEXT,
-			thumbnail_path TEXT,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			FOREIGN KEY (request_id) REFERENCES requests(id)
-		);
-	`)
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER,
+            url TEXT,
+            file_path TEXT,
+            thumbnail_path TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (request_id) REFERENCES requests(id)
+        );
+        CREATE TABLE IF NOT EXISTS people (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS photo_tags (
+            photo_path TEXT,
+            person_id INTEGER,
+            FOREIGN KEY (photo_path) REFERENCES photos(file_path),
+            FOREIGN KEY (person_id) REFERENCES people(id),
+            PRIMARY KEY (photo_path, person_id)
+        );
+        CREATE TABLE IF NOT EXISTS photo_colors (
+            photo_path TEXT,
+            color_hex TEXT,
+            FOREIGN KEY (photo_path) REFERENCES photos(file_path),
+            PRIMARY KEY (photo_path, color_hex)
+        )`)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	// New people table: unique ID and name
-	_, err = db.Exec(`
-	CREATE TABLE IF NOT EXISTS people (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT UNIQUE
-	)`)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// New photo_tags table: links photos to people
-	_, err = db.Exec(`
-	CREATE TABLE IF NOT EXISTS photo_tags (
-		photo_path TEXT,
-		person_id INTEGER,
-		FOREIGN KEY (photo_path) REFERENCES photos(file_path),
-		FOREIGN KEY (person_id) REFERENCES people(id),
-		PRIMARY KEY (photo_path, person_id)
-	)`)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	return db
 }
 
