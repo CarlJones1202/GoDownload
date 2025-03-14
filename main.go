@@ -272,40 +272,38 @@ func processPhotoForTagging(filePath string) error {
 }
 
 func extractPersonNameFromURL(url string) string {
-	// Extract the thread part after "threads/"
+	// Extract thread part
 	parts := strings.Split(url, "/threads/")
 	if len(parts) < 2 {
 		return ""
 	}
 	thread := parts[1]
 
-	// Split by "-" and skip the numeric thread ID
+	// Split by "-" and handle thread ID
 	segments := strings.Split(thread, "-")
-	if len(segments) < 3 { // Need at least ID, prefix/site, and name
+	if len(segments) < 3 {
 		return ""
 	}
 
-	// Skip known site prefixes
-	knownPrefixes := map[string]bool{
-		"MetArt":     true,
-		"MetArt-com": true,
-		// Add more prefixes as needed (e.g., "Studio", "Playboy")
+	// Join segments up to the first non-prefix part to handle multi-part prefixes like "MetArt-com"
+	prefixEnd := 1
+	for i := 1; i < len(segments); i++ {
+		if strings.HasSuffix(strings.ToLower(segments[i]), "com") || strings.ToLower(segments[i]) == "metart" {
+			prefixEnd = i + 1
+		} else {
+			break
+		}
 	}
 
-	// Start after the thread ID (segments[0] is the ID)
-	nameStartIdx := 1
-	if knownPrefixes[segments[1]] || strings.HasSuffix(segments[1], "com") {
-		nameStartIdx = 2 // Skip prefix like "MetArt-com"
-	}
-
-	// Collect name segments until we hit gallery details (e.g., resolution, date, or "x[digits]")
+	// Collect name parts until gallery details
 	var nameParts []string
-	for i := nameStartIdx; i < len(segments); i++ {
+	for i := prefixEnd; i < len(segments); i++ {
 		segment := segments[i]
-		// Stop at gallery details: resolution (e.g., "3148x4720"), count (e.g., "x130"), or date (e.g., "(Jan-27-2024)")
+		// Stop at gallery details: resolution, count, or parenthetical date
 		if regexp.MustCompile(`^\d+x\d+$`).MatchString(segment) || // e.g., "3148x4720"
 			regexp.MustCompile(`^x\d+$`).MatchString(segment) || // e.g., "x130"
-			strings.Contains(segment, "(") { // e.g., "(Jan-27-2024)"
+			strings.Contains(segment, "(") || // e.g., "(Jan-27-2024)"
+			(i > prefixEnd && regexp.MustCompile(`^[A-Z][a-z]+$`).MatchString(segment)) { // e.g., "Flirty"
 			break
 		}
 		nameParts = append(nameParts, segment)
@@ -315,19 +313,19 @@ func extractPersonNameFromURL(url string) string {
 		return ""
 	}
 
-	// Join name parts and clean up
+	// Join and clean name
 	name := strings.Join(nameParts, " ")
-	name = strings.ReplaceAll(name, "-", " ") // Handle "Azzurra-Moretti" -> "Azzurra Moretti"
+	name = strings.ReplaceAll(name, "-", " ")
 	name = strings.TrimSpace(name)
 
-	// Handle aliases in parentheses if they appear in the name segment
+	// Handle aliases in parentheses if they appear early
 	re := regexp.MustCompile(`(.+?)\s*\((.+?)\)`)
 	matches := re.FindStringSubmatch(name)
 	if len(matches) >= 2 {
-		name = matches[1] // Take primary name before parentheses
+		name = matches[1]
 	}
 
-	// Validate: ensure it looks like a name (letters and spaces)
+	// Validate: letters and spaces only
 	if !regexp.MustCompile(`^[a-zA-Z\s]+$`).MatchString(name) {
 		return ""
 	}
