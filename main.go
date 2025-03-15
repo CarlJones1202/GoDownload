@@ -134,7 +134,7 @@ func extractAndStoreColors(filePath string) error {
 
 	// Cluster colors using k-means (top 3 colors)
 	km := kmeans.New()
-	clusters, err := km.Partition(observations, 3)
+	clusters, err := km.Partition(observations, 6)
 	if err != nil {
 		return fmt.Errorf("clustering colors: %v", err)
 	}
