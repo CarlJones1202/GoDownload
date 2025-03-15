@@ -45,8 +45,9 @@ func main() {
 		log.Printf("Error checking/redownloading files: %v", err)
 	}
 
-	go taggingService()
-	go colorExtractionService()
+	// go taggingService()
+	// go colorExtractionService()
+	// go processPendingDownloads() // New background service
 
 	r := gin.Default()
 	r.Use(corsMiddleware())
@@ -62,7 +63,63 @@ func main() {
 	r.GET("/galleries", listGalleries)
 	r.GET("/ws", handleWebSocket)
 
-	log.Fatal(r.Run(":8080"))
+	log.Fatal(r.Run(":8081"))
+}
+
+func processPendingDownloads() {
+	for {
+		rows, err := db.Query("SELECT id, url FROM requests WHERE status = 'pending' LIMIT 1")
+		if err != nil {
+			log.Printf("Error querying pending requests: %v", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		var id int
+		var url string
+		hasNext := rows.Next()
+		if !hasNext {
+			rows.Close()
+			log.Printf("No pending downloads, waiting...")
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		err = rows.Scan(&id, &url)
+		rows.Close()
+		if err != nil {
+			log.Printf("Error scanning pending request: %v", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		// Mark as processing
+		_, err = db.Exec("UPDATE requests SET status = 'processing' WHERE id = ?", id)
+		if err != nil {
+			log.Printf("Error marking request %d as processing: %v", id, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		// Process the URL
+		log.Printf("Processing request %d: %s", id, url)
+		err = processURL(url)
+		if err != nil {
+			log.Printf("Failed to process URL %s: %v", url, err)
+			_, err = db.Exec("UPDATE requests SET status = 'failed' WHERE id = ?", id)
+			if err != nil {
+				log.Printf("Error marking request %d as failed: %v", id, err)
+			}
+		} else {
+			_, err = db.Exec("UPDATE requests SET status = 'completed' WHERE id = ?", id)
+			if err != nil {
+				log.Printf("Error marking request %d as completed: %v", id, err)
+			}
+			log.Printf("Completed processing request %d: %s", id, url)
+		}
+
+		time.Sleep(2 * time.Second) // Small delay between processing
+	}
 }
 
 // New color extraction service
@@ -352,20 +409,22 @@ func extractPersonNameFromURL(url string) string {
 
 func queueDownloads(c *gin.Context) {
 	var req struct {
-		URLs []string `json:"urls"`
+		URL string `json:"url"`
 	}
 	if err := c.BindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	go func() {
-		for _, url := range req.URLs {
-			if err := processURL(url); err != nil {
-				log.Printf("Error processing URL %s: %v", url, err)
-			}
-		}
-	}()
+	// Insert into requests table with pending status
+	_, err := db.Exec(
+		"INSERT INTO requests (url, created_at, status) VALUES (?, ?, 'pending') ON CONFLICT(url) DO NOTHING",
+		req.URL, time.Now().Format(time.RFC3339),
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to queue download: " + err.Error()})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Download queued"})
 }
@@ -847,7 +906,7 @@ func checkAndRedownloadMissingFiles() error {
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
