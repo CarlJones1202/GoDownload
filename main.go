@@ -566,7 +566,7 @@ func listPhotos(c *gin.Context) {
 
 	query += `
         GROUP BY p.file_path 
-        ORDER BY p.created_at DESC 
+        ORDER BY p.request_id DESC, p.created_at DESC 
         LIMIT ? OFFSET ?`
 	args = append(args, perPage, (page-1)*perPage)
 
