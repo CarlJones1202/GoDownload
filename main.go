@@ -271,14 +271,23 @@ func extractPersonNameFromURL(url string) string {
 	}
 	log.Printf("Segments: %v", segments)
 
-	// Skip thread ID and prefixes
+	// Skip thread ID and prefixes, including date (YYYY-MM-DD)
 	startIdx := 1
 	knownPrefixes := map[string]bool{
 		"metart":     true,
 		"metart-com": true,
 		"studio":     true,
 	}
-	for i := 1; i < len(segments); i++ {
+	// Check for date pattern: YYYY-MM-DD (e.g., "2016-01-03")
+	if startIdx+2 < len(segments) &&
+		regexp.MustCompile(`^\d{4}$`).MatchString(segments[startIdx]) &&
+		regexp.MustCompile(`^\d{2}$`).MatchString(segments[startIdx+1]) &&
+		regexp.MustCompile(`^\d{2}$`).MatchString(segments[startIdx+2]) {
+		log.Printf("Detected date pattern at index %d: %s-%s-%s", startIdx, segments[startIdx], segments[startIdx+1], segments[startIdx+2])
+		startIdx += 3 // Skip past the date
+	}
+	// Skip known prefixes
+	for i := startIdx; i < len(segments); i++ {
 		lowerSeg := strings.ToLower(segments[i])
 		if knownPrefixes[lowerSeg] || strings.HasSuffix(lowerSeg, "com") {
 			startIdx = i + 1
@@ -301,11 +310,11 @@ func extractPersonNameFromURL(url string) string {
 		}
 
 		// Stop at gallery details, metadata, or date indicators
-		if regexp.MustCompile(`^\d+x\d+$`).MatchString(segment) || // e.g., "6000px"
-			regexp.MustCompile(`^x\d+$`).MatchString(segment) || // e.g., "x130"
-			strings.Contains(segment, "(") || // e.g., "(Jan"
+		if regexp.MustCompile(`^\d+x\d+$`).MatchString(segment) || // e.g., "3456x5184"
+			regexp.MustCompile(`^x\d+$`).MatchString(segment) || // e.g., "x120"
+			strings.Contains(segment, "(") || // e.g., "(x120)"
 			lowerSeg == "pictures" || lowerSeg == "px" || // e.g., "pictures"
-			(i > startIdx && regexp.MustCompile(`^[A-Z][a-z]+$`).MatchString(segment)) { // e.g., "Flirty"
+			(i > startIdx && regexp.MustCompile(`^[A-Z][a-z]+$`).MatchString(segment)) { // e.g., "Madera"
 			log.Printf("Stopping at segment %s (index %d)", segment, i)
 			break
 		}
@@ -441,13 +450,16 @@ func listPeople(c *gin.Context) {
         SELECT p.id, p.name, 
                COALESCE(p.profile_photo_path, '') as profile_photo_path, 
                COUNT(pt.photo_path) as photo_count, 
-               GROUP_CONCAT(a.alias, ',') as aliases
+               (SELECT GROUP_CONCAT(alias, ',') 
+                FROM (SELECT DISTINCT a.alias 
+                      FROM aliases a 
+                      WHERE a.person_id = p.id)) as aliases
         FROM people p
         LEFT JOIN photo_tags pt ON p.id = pt.person_id
-        LEFT JOIN aliases a ON p.id = a.person_id
-        GROUP BY p.id, p.name, p.profile_photo_path
+        GROUP BY p.id, p.name, COALESCE(p.profile_photo_path, '')
         ORDER BY p.name`)
 	if err != nil {
+		log.Printf("Query failed: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -462,14 +474,23 @@ func listPeople(c *gin.Context) {
 			Aliases          []string `json:"aliases"`
 		}
 		var aliases sql.NullString
-		if err := rows.Scan(&p.ID, &p.Name, &p.ProfilePhotoPath, &p.PhotoCount, &aliases); err != nil {
+		err := rows.Scan(&p.ID, &p.Name, &p.ProfilePhotoPath, &p.PhotoCount, &aliases)
+		if err != nil {
+			log.Printf("Scan failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 		if aliases.Valid {
 			p.Aliases = strings.Split(aliases.String, ",")
+		} else {
+			p.Aliases = []string{}
 		}
 		people = append(people, p)
+	}
+	if err = rows.Err(); err != nil {
+		log.Printf("Rows iteration failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 	c.JSON(http.StatusOK, people)
 }
