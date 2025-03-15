@@ -45,9 +45,9 @@ func main() {
 		log.Printf("Error checking/redownloading files: %v", err)
 	}
 
-	// go taggingService()
-	// go colorExtractionService()
-	// go processPendingDownloads() // New background service
+	go taggingService()
+	go colorExtractionService()
+	go processPendingDownloads() // New background service
 
 	r := gin.Default()
 	r.Use(corsMiddleware())
@@ -329,20 +329,28 @@ func extractPersonNameFromURL(url string) string {
 	}
 	log.Printf("Segments: %v", segments)
 
-	// Skip thread ID and prefixes, including date (YYYY-MM-DD)
+	// Skip thread ID and prefixes, including date (YYYY-MM-DD or YYYY_MM_DD)
 	startIdx := 1
 	knownPrefixes := map[string]bool{
 		"metart":     true,
 		"metart-com": true,
 		"studio":     true,
 	}
-	// Check for date pattern: YYYY-MM-DD (e.g., "2016-01-03")
-	if startIdx+2 < len(segments) &&
-		regexp.MustCompile(`^\d{4}$`).MatchString(segments[startIdx]) &&
-		regexp.MustCompile(`^\d{2}$`).MatchString(segments[startIdx+1]) &&
-		regexp.MustCompile(`^\d{2}$`).MatchString(segments[startIdx+2]) {
-		log.Printf("Detected date pattern at index %d: %s-%s-%s", startIdx, segments[startIdx], segments[startIdx+1], segments[startIdx+2])
-		startIdx += 3 // Skip past the date
+	// Check for date pattern: YYYY-MM-DD (e.g., "2016-01-03") or YYYY_MM_DD (e.g., "2016_01_13")
+	if startIdx+2 < len(segments) {
+		// Handle YYYY-MM-DD
+		if regexp.MustCompile(`^\d{4}$`).MatchString(segments[startIdx]) &&
+			regexp.MustCompile(`^\d{2}$`).MatchString(segments[startIdx+1]) &&
+			regexp.MustCompile(`^\d{2}$`).MatchString(segments[startIdx+2]) {
+			log.Printf("Detected date pattern at index %d: %s-%s-%s", startIdx, segments[startIdx], segments[startIdx+1], segments[startIdx+2])
+			startIdx += 3 // Skip past the date
+		} else {
+			// Handle YYYY_MM_DD in a single segment (e.g., "2016_01_13")
+			if regexp.MustCompile(`^\d{4}_\d{2}_\d{2}$`).MatchString(segments[startIdx]) {
+				log.Printf("Detected underscore date pattern at index %d: %s", startIdx, segments[startIdx])
+				startIdx++ // Skip the single date segment
+			}
+		}
 	}
 	// Skip known prefixes
 	for i := startIdx; i < len(segments); i++ {
@@ -361,7 +369,7 @@ func extractPersonNameFromURL(url string) string {
 		segment := segments[i]
 		lowerSeg := strings.ToLower(segment)
 
-		// Early rejection: any segment with numbers
+		// Early rejection: any segment with numbers (unless it's the date we skipped)
 		if regexp.MustCompile(`\d`).MatchString(segment) {
 			log.Printf("Segment %s (index %d) rejected: contains numbers", segment, i)
 			break
@@ -372,7 +380,7 @@ func extractPersonNameFromURL(url string) string {
 			regexp.MustCompile(`^x\d+$`).MatchString(segment) || // e.g., "x120"
 			strings.Contains(segment, "(") || // e.g., "(x120)"
 			lowerSeg == "pictures" || lowerSeg == "px" || // e.g., "pictures"
-			(i > startIdx && regexp.MustCompile(`^[A-Z][a-z]+$`).MatchString(segment)) { // e.g., "Madera"
+			(i > startIdx && regexp.MustCompile(`^[A-Z][a-z]+$`).MatchString(segment) && len(nameParts) > 0) { // e.g., "Qetena" after name
 			log.Printf("Stopping at segment %s (index %d)", segment, i)
 			break
 		}
@@ -381,7 +389,7 @@ func extractPersonNameFromURL(url string) string {
 
 	if len(nameParts) == 0 {
 		log.Printf("No name parts found in %s after index %d", url, startIdx)
-		return ""
+		return "Unknown"
 	}
 	log.Printf("Name parts: %v", nameParts)
 
