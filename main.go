@@ -54,6 +54,7 @@ func main() {
 	r.POST("/download", queueDownloads)
 	r.GET("/photos", listPhotos)
 	r.GET("/people", listPeople)
+	r.PUT("/people/:id", updatePersonName)
 	r.POST("/people/combine", combinePeople)
 	r.GET("/people/:id/photos", listPersonPhotos)
 	r.POST("/people/:id/alias", addAlias)
@@ -369,9 +370,49 @@ func queueDownloads(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Download queued"})
 }
 
+func updatePersonName(c *gin.Context) {
+	personID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid person ID"})
+		return
+	}
+
+	var req struct {
+		Name string `json:"name" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Name is required"})
+		return
+	}
+
+	// Check if person exists
+	var exists int
+	err = db.QueryRow("SELECT COUNT(*) FROM people WHERE id = ?", personID).Scan(&exists)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if exists == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Person not found"})
+		return
+	}
+
+	_, err = db.Exec("UPDATE people SET name = ? WHERE id = ?", req.Name, personID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Name updated successfully"})
+}
+
 func listPhotos(c *gin.Context) {
 	pageStr := c.DefaultQuery("page", "1")
 	perPageStr := c.DefaultQuery("per_page", "50")
+	personIDStr := c.Query("person_id")
+	galleryIDStr := c.Query("gallery_id")
+	tag := c.Query("tag")
+	color := c.Query("color")
 
 	page, _ := strconv.Atoi(pageStr)
 	if page < 1 {
@@ -392,24 +433,84 @@ func listPhotos(c *gin.Context) {
 		Colors    []string `json:"Colors"`
 	}
 
-	var photos []PhotoWithTagsAndColors
-	rows, err := db.Query(`
+	query := `
         SELECT p.request_id, p.url, p.file_path, p.thumbnail_path, p.created_at, 
                GROUP_CONCAT(pe.name, ','), GROUP_CONCAT(pc.color_hex, ',') 
         FROM photos p 
         LEFT JOIN photo_tags pt ON p.file_path = pt.photo_path 
         LEFT JOIN people pe ON pt.person_id = pe.id 
-        LEFT JOIN photo_colors pc ON p.file_path = pc.photo_path 
+        LEFT JOIN photo_colors pc ON p.file_path = pc.photo_path
+    `
+	countQuery := "SELECT COUNT(DISTINCT p.file_path) FROM photos p"
+	whereClauses := []string{}
+	args := []interface{}{}
+
+	// Filter by person_id
+	if personIDStr != "" {
+		personID, err := strconv.Atoi(personIDStr)
+		if err == nil {
+			query += " JOIN photo_tags pt_person ON p.file_path = pt_person.photo_path"
+			countQuery += " JOIN photo_tags pt_person ON p.file_path = pt_person.photo_path"
+			whereClauses = append(whereClauses, "pt_person.person_id = ?")
+			args = append(args, personID)
+		}
+	}
+
+	// Filter by gallery_id (request_id)
+	if galleryIDStr != "" {
+		galleryID, err := strconv.Atoi(galleryIDStr)
+		if err == nil {
+			whereClauses = append(whereClauses, "p.request_id = ?")
+			args = append(args, galleryID)
+		}
+	}
+
+	// Filter by tag (person name or alias)
+	if tag != "" {
+		query += " LEFT JOIN aliases a ON pe.id = a.person_id"
+		countQuery += " LEFT JOIN photo_tags pt_tag ON p.file_path = pt_tag.photo_path"
+		countQuery += " LEFT JOIN people pe_tag ON pt_tag.person_id = pe_tag.id"
+		countQuery += " LEFT JOIN aliases a ON pe_tag.id = a.person_id"
+		whereClauses = append(whereClauses, "(pe.name LIKE ? OR a.alias LIKE ?)")
+		args = append(args, "%"+tag+"%", "%"+tag+"%")
+	}
+
+	// Filter by color (simple exact match for now, similarity below)
+	if color != "" {
+		query += " JOIN photo_colors pc_color ON p.file_path = pc_color.photo_path"
+		countQuery += " JOIN photo_colors pc_color ON p.file_path = pc_color.photo_path"
+		r, g, b, err := hexToRGB(color)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid color hex"})
+			return
+		}
+		// Allow ±20 range for each RGB component
+		whereClauses = append(whereClauses, `
+			ABS(CAST('0x' || SUBSTR(pc_color.color_hex, 2, 2) AS INTEGER) - ?) <= 20 AND
+			ABS(CAST('0x' || SUBSTR(pc_color.color_hex, 4, 2) AS INTEGER) - ?) <= 20 AND
+			ABS(CAST('0x' || SUBSTR(pc_color.color_hex, 6, 2) AS INTEGER) - ?) <= 20`)
+		args = append(args, r, g, b)
+	}
+
+	if len(whereClauses) > 0 {
+		query += " WHERE " + strings.Join(whereClauses, " AND ")
+		countQuery += " WHERE " + strings.Join(whereClauses, " AND ")
+	}
+
+	query += `
         GROUP BY p.file_path 
         ORDER BY p.created_at DESC 
-        LIMIT ? OFFSET ?`,
-		perPage, (page-1)*perPage)
+        LIMIT ? OFFSET ?`
+	args = append(args, perPage, (page-1)*perPage)
+
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
 
+	var photos []PhotoWithTagsAndColors
 	for rows.Next() {
 		var p PhotoWithTagsAndColors
 		var tags, colors sql.NullString
@@ -427,7 +528,11 @@ func listPhotos(c *gin.Context) {
 	}
 
 	var total int
-	db.QueryRow("SELECT COUNT(*) FROM photos").Scan(&total)
+	err = db.QueryRow(countQuery, args[:len(args)-2]...).Scan(&total) // Exclude LIMIT/OFFSET for count
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"photos":      photos,
@@ -438,24 +543,48 @@ func listPhotos(c *gin.Context) {
 	})
 }
 
+// hexToRGB converts a hex color to RGB values
+func hexToRGB(hex string) (r, g, b int, err error) {
+	hex = strings.TrimPrefix(hex, "#")
+	if len(hex) != 6 {
+		return 0, 0, 0, fmt.Errorf("invalid hex color: %s", hex)
+	}
+	rVal, err := strconv.ParseInt(hex[0:2], 16, 32)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	gVal, err := strconv.ParseInt(hex[2:4], 16, 32)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	bVal, err := strconv.ParseInt(hex[4:6], 16, 32)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return int(rVal), int(gVal), int(bVal), nil
+}
+
 func listPeople(c *gin.Context) {
 	var people []struct {
 		ID               int      `json:"id"`
 		Name             string   `json:"name"`
 		ProfilePhotoPath string   `json:"profilePhotoPath"`
 		PhotoCount       int      `json:"photoCount"`
+		GalleryCount     int      `json:"galleryCount"` // New field
 		Aliases          []string `json:"aliases"`
 	}
 	rows, err := db.Query(`
         SELECT p.id, p.name, 
                COALESCE(p.profile_photo_path, '') as profile_photo_path, 
-               COUNT(pt.photo_path) as photo_count, 
+               COUNT(pt.photo_path) as photo_count,
+               COUNT(DISTINCT ph.request_id) as gallery_count,
                (SELECT GROUP_CONCAT(alias, ',') 
                 FROM (SELECT DISTINCT a.alias 
                       FROM aliases a 
                       WHERE a.person_id = p.id)) as aliases
         FROM people p
         LEFT JOIN photo_tags pt ON p.id = pt.person_id
+        LEFT JOIN photos ph ON pt.photo_path = ph.file_path
         GROUP BY p.id, p.name, COALESCE(p.profile_photo_path, '')
         ORDER BY p.name`)
 	if err != nil {
@@ -471,10 +600,11 @@ func listPeople(c *gin.Context) {
 			Name             string   `json:"name"`
 			ProfilePhotoPath string   `json:"profilePhotoPath"`
 			PhotoCount       int      `json:"photoCount"`
+			GalleryCount     int      `json:"galleryCount"`
 			Aliases          []string `json:"aliases"`
 		}
 		var aliases sql.NullString
-		err := rows.Scan(&p.ID, &p.Name, &p.ProfilePhotoPath, &p.PhotoCount, &aliases)
+		err := rows.Scan(&p.ID, &p.Name, &p.ProfilePhotoPath, &p.PhotoCount, &p.GalleryCount, &aliases)
 		if err != nil {
 			log.Printf("Scan failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
