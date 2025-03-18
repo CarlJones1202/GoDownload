@@ -71,7 +71,6 @@ func initDB() *sql.DB {
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	_, err = db.Exec("UPDATE requests SET status = 'pending' WHERE status = 'processing'")
 	if err != nil {
 		log.Fatal(err)

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -20,14 +21,21 @@ func sanitizeFolderName(name string) string {
 	return sanitizedName
 }
 
-func DownloadFile(url, filepath string) error {
-	fmt.Printf("Starting download of %s to %s\n", url, filepath)
-	out, err := os.Create(filepath)
+func DownloadFile(url, path string) error {
+	fmt.Printf("Starting download of %s to %s\n", url, path)
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("creating directory %s: %v", dir, err)
+	}
+	fmt.Printf("Ensured directory %s exists\n", dir)
+
+	out, err := os.Create(path)
 	if err != nil {
-		return fmt.Errorf("creating file %s: %v", filepath, err)
+		return fmt.Errorf("creating file %s: %v", path, err)
 	}
 	defer out.Close()
-	fmt.Printf("Created file %s\n", filepath)
+	fmt.Printf("Created file %s\n", path)
 
 	resp, err := http.Get(url)
 	if err != nil {
@@ -42,9 +50,9 @@ func DownloadFile(url, filepath string) error {
 
 	_, err = io.Copy(out, resp.Body)
 	if err != nil {
-		return fmt.Errorf("writing to %s: %v", filepath, err)
+		return fmt.Errorf("writing to %s: %v", path, err)
 	}
-	fmt.Printf("Completed writing to %s\n", filepath)
+	fmt.Printf("Completed writing to %s\n", path)
 	return nil
 }
 

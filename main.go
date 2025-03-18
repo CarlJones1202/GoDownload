@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -41,10 +43,14 @@ func main() {
 	}
 
 	db = initDB()
-	if err := checkAndRedownloadMissingFiles(); err != nil {
-		log.Printf("Error checking/redownloading files: %v", err)
-	}
 
+	go func() {
+		for {
+			if err := checkAndRedownloadMissingFiles(); err != nil {
+				log.Printf("Redownload check failed: %v", err)
+			}
+		}
+	}()
 	go taggingService()
 	go colorExtractionService()
 	go processPendingDownloads() // New background service
@@ -887,7 +893,16 @@ func broadcastNewPhoto() {
 	}
 }
 
+const maxConcurrentDownloads = 5
+
 func checkAndRedownloadMissingFiles() error {
+	// Fetch all rows into memory to release the database connection quickly
+	type photo struct {
+		url      string
+		filePath string
+	}
+	var photos []photo
+
 	rows, err := db.Query("SELECT url, file_path FROM photos")
 	if err != nil {
 		return fmt.Errorf("querying photos: %v", err)
@@ -899,18 +914,88 @@ func checkAndRedownloadMissingFiles() error {
 		if err := rows.Scan(&url, &filePath); err != nil {
 			return fmt.Errorf("scanning photo: %v", err)
 		}
-		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		photos = append(photos, photo{url: url, filePath: filePath})
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("reading rows: %v", err)
+	}
+	// rows.Close() is called via defer, releasing the DB connection here
+
+	// Filter missing files
+	var tasks []photo
+	for _, p := range photos {
+		if _, err := os.Stat(p.filePath); os.IsNotExist(err) {
+			tasks = append(tasks, p)
+		}
+	}
+
+	if len(tasks) == 0 {
+		log.Printf("No missing files to redownload")
+		return nil
+	}
+
+	// Semaphore to limit concurrency
+	sem := make(chan struct{}, maxConcurrentDownloads)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errors []error
+
+	// Process tasks concurrently
+	for _, task := range tasks {
+		wg.Add(1)
+		sem <- struct{}{} // Acquire semaphore slot
+		go func(url, filePath string) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release semaphore slot
+
 			log.Printf("File missing: %s, redownloading from %s", filePath, url)
 			if err := DownloadFile(url, filePath); err != nil {
 				log.Printf("Failed to redownload %s: %v", url, err)
-			} else {
-				log.Printf("Redownloaded %s to %s", url, filePath)
+				mu.Lock()
+				errors = append(errors, fmt.Errorf("redownload %s: %v", url, err))
+				mu.Unlock()
+				return
 			}
-		}
+
+			log.Printf("Redownloaded %s to %s", url, filePath)
+			filename := path.Base(filePath)
+			directory := filepath.Dir(filePath)
+			thumbnailDir := directory + "/thumbnails"
+			if err := os.MkdirAll(thumbnailDir, 0755); err != nil {
+				log.Printf("Failed to create thumbnail dir %s: %v", thumbnailDir, err)
+				mu.Lock()
+				errors = append(errors, fmt.Errorf("create thumbnail dir %s: %v", thumbnailDir, err))
+				mu.Unlock()
+				return
+			}
+
+			thumbnailPath := fmt.Sprintf("%s/thumb_%s", thumbnailDir, filename)
+			if err := generateThumbnail(filePath, thumbnailPath); err != nil {
+				log.Printf("Error generating thumbnail for %s: %v", filePath, err)
+				mu.Lock()
+				errors = append(errors, fmt.Errorf("generate thumbnail %s: %v", filePath, err))
+				mu.Unlock()
+			} else {
+				log.Printf("Generated thumbnail: %s", thumbnailPath)
+			}
+		}(task.url, task.filePath)
 	}
+
+	// Wait for all downloads to complete
+	wg.Wait()
+
+	// Report aggregated errors
+	if len(errors) > 0 {
+		errMsg := "Errors during redownload:\n"
+		for _, err := range errors {
+			errMsg += fmt.Sprintf("- %v\n", err)
+		}
+		return fmt.Errorf(errMsg)
+	}
+
+	log.Printf("Completed redownloading %d files", len(tasks))
 	return nil
 }
-
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
