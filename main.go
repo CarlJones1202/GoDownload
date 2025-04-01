@@ -830,12 +830,37 @@ func setProfilePhoto(c *gin.Context) {
 }
 
 func listGalleries(c *gin.Context) {
+	personIDStr := c.Query("person_id")
+
 	var galleries []struct {
 		ID        int    `json:"id"`
 		URL       string `json:"url"`
 		CreatedAt string `json:"createdAt"`
 	}
-	rows, err := db.Query("SELECT id, url, created_at FROM requests ORDER BY created_at DESC")
+
+	query := `
+        SELECT DISTINCT r.id, r.url, r.created_at
+        FROM requests r
+        JOIN photos p ON r.id = p.request_id
+    `
+	var args []interface{}
+
+	if personIDStr != "" {
+		personID, err := strconv.Atoi(personIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid person_id"})
+			return
+		}
+		query += `
+            JOIN photo_tags pt ON p.file_path = pt.photo_path
+            WHERE pt.person_id = ?
+        `
+		args = append(args, personID)
+	}
+
+	query += " ORDER BY r.created_at DESC"
+
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -854,6 +879,12 @@ func listGalleries(c *gin.Context) {
 		}
 		galleries = append(galleries, g)
 	}
+
+	if err := rows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	c.JSON(http.StatusOK, galleries)
 }
 
