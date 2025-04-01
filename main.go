@@ -2,13 +2,13 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,10 +66,48 @@ func main() {
 	r.GET("/people/:id/photos", listPersonPhotos)
 	r.POST("/people/:id/alias", addAlias)
 	r.POST("/people/:id/profile-photo", setProfilePhoto)
+	r.GET("/people/search", searchStashDBPeople)
+	r.POST("/people", addPerson)
+	r.POST("/photos/:path/tag", tagPhoto)
 	r.GET("/galleries", listGalleries)
 	r.GET("/ws", handleWebSocket)
 
 	log.Fatal(r.Run(":8081"))
+}
+
+func addPerson(c *gin.Context) {
+	var p Person
+	if err := c.ShouldBindJSON(&p); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	aliasesJSON, _ := json.Marshal(p.Aliases)
+	result, err := db.Exec("INSERT INTO people (name, aliases) VALUES (?, ?)", p.Name, aliasesJSON)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add person"})
+		return
+	}
+	id, _ := result.LastInsertId()
+	p.ID = int(id)
+
+	c.JSON(http.StatusOK, p)
+}
+
+func tagPhoto(c *gin.Context) {
+	path := c.Param("path")
+	var req TagRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	_, err := db.Exec("INSERT INTO photo_tags (photo_path, person_id) VALUES (?, ?)", path, req.PersonID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to tag photo"})
+		return
+	}
+	c.Status(http.StatusOK)
 }
 
 func processPendingDownloads() {
@@ -267,158 +305,6 @@ func taggingService() {
 			time.Sleep(2 * time.Second)
 		}
 	}
-}
-
-// Placeholder for photo processing and tagging
-func processPhotoForTagging(photoPath string) error {
-	var galleryURL string
-	err := db.QueryRow(`
-        SELECT r.url 
-        FROM photos p 
-        JOIN requests r ON p.request_id = r.id 
-        WHERE p.file_path = ?`, photoPath).Scan(&galleryURL)
-	if err != nil {
-		return fmt.Errorf("fetching gallery URL for %s: %v", photoPath, err)
-	}
-	log.Printf("Processing photo %s with gallery URL: %s", photoPath, galleryURL)
-
-	name := extractPersonNameFromURL(galleryURL)
-	if name == "" {
-		log.Printf("No valid name extracted from %s", galleryURL)
-		return nil
-	}
-	log.Printf("Extracted name for tagging: %s", name)
-
-	var personID int
-	err = db.QueryRow("SELECT id FROM people WHERE name = ?", name).Scan(&personID)
-	if err == sql.ErrNoRows {
-		res, err := db.Exec("INSERT INTO people (name) VALUES (?)", name)
-		if err != nil {
-			return fmt.Errorf("inserting person %s: %v", name, err)
-		}
-		id, _ := res.LastInsertId()
-		personID = int(id)
-		log.Printf("Created new person %s with ID %d", name, personID)
-	} else if err != nil {
-		return fmt.Errorf("fetching person %s: %v", name, err)
-	}
-
-	_, err = db.Exec(`
-        INSERT OR IGNORE INTO photo_tags (photo_path, person_id) 
-        VALUES (?, ?)`, photoPath, personID)
-	if err != nil {
-		return fmt.Errorf("tagging photo %s with person %d: %v", photoPath, personID, err)
-	}
-
-	log.Printf("Tagged %s with person %s (ID: %d) from gallery %s", photoPath, name, personID, galleryURL)
-	return nil
-}
-
-func extractPersonNameFromURL(url string) string {
-	// Extract thread part
-	parts := strings.Split(url, "/threads/")
-	if len(parts) < 2 {
-		log.Printf("URL %s has no thread part", url)
-		return ""
-	}
-	thread := parts[1]
-	if strings.Contains(thread, "?") {
-		thread = strings.Split(thread, "?")[0]
-	}
-	log.Printf("Thread: %s", thread)
-
-	// Split by "-"
-	segments := strings.Split(thread, "-")
-	if len(segments) < 3 {
-		log.Printf("URL %s has too few segments: %v", url, segments)
-		return ""
-	}
-	log.Printf("Segments: %v", segments)
-
-	// Skip thread ID and prefixes, including date (YYYY-MM-DD or YYYY_MM_DD)
-	startIdx := 1
-	knownPrefixes := map[string]bool{
-		"metart":     true,
-		"metart-com": true,
-		"studio":     true,
-	}
-	// Check for date pattern: YYYY-MM-DD (e.g., "2016-01-03") or YYYY_MM_DD (e.g., "2016_01_13")
-	if startIdx+2 < len(segments) {
-		// Handle YYYY-MM-DD
-		if regexp.MustCompile(`^\d{4}$`).MatchString(segments[startIdx]) &&
-			regexp.MustCompile(`^\d{2}$`).MatchString(segments[startIdx+1]) &&
-			regexp.MustCompile(`^\d{2}$`).MatchString(segments[startIdx+2]) {
-			log.Printf("Detected date pattern at index %d: %s-%s-%s", startIdx, segments[startIdx], segments[startIdx+1], segments[startIdx+2])
-			startIdx += 3 // Skip past the date
-		} else {
-			// Handle YYYY_MM_DD in a single segment (e.g., "2016_01_13")
-			if regexp.MustCompile(`^\d{4}_\d{2}_\d{2}$`).MatchString(segments[startIdx]) {
-				log.Printf("Detected underscore date pattern at index %d: %s", startIdx, segments[startIdx])
-				startIdx++ // Skip the single date segment
-			}
-		}
-	}
-	// Skip known prefixes
-	for i := startIdx; i < len(segments); i++ {
-		lowerSeg := strings.ToLower(segments[i])
-		if knownPrefixes[lowerSeg] || strings.HasSuffix(lowerSeg, "com") {
-			startIdx = i + 1
-		} else {
-			break
-		}
-	}
-	log.Printf("Name search starts at index %d (%s)", startIdx, segments[startIdx-1])
-
-	// Collect name parts (max 2 words)
-	var nameParts []string
-	for i := startIdx; i < len(segments) && len(nameParts) < 2; i++ {
-		segment := segments[i]
-		lowerSeg := strings.ToLower(segment)
-
-		// Early rejection: any segment with numbers (unless it's the date we skipped)
-		if regexp.MustCompile(`\d`).MatchString(segment) {
-			log.Printf("Segment %s (index %d) rejected: contains numbers", segment, i)
-			break
-		}
-
-		// Stop at gallery details, metadata, or date indicators
-		if regexp.MustCompile(`^\d+x\d+$`).MatchString(segment) || // e.g., "3456x5184"
-			regexp.MustCompile(`^x\d+$`).MatchString(segment) || // e.g., "x120"
-			strings.Contains(segment, "(") || // e.g., "(x120)"
-			lowerSeg == "pictures" || lowerSeg == "px" || // e.g., "pictures"
-			(i > startIdx && regexp.MustCompile(`^[A-Z][a-z]+$`).MatchString(segment) && len(nameParts) > 0) { // e.g., "Qetena" after name
-			log.Printf("Stopping at segment %s (index %d)", segment, i)
-			break
-		}
-		nameParts = append(nameParts, segment)
-	}
-
-	if len(nameParts) == 0 {
-		log.Printf("No name parts found in %s after index %d", url, startIdx)
-		return "Unknown"
-	}
-	log.Printf("Name parts: %v", nameParts)
-
-	// Join and clean name
-	name := strings.Join(nameParts, " ")
-	name = strings.ReplaceAll(name, "-", " ")
-	name = strings.TrimSpace(name)
-	log.Printf("Candidate name: %s", name)
-
-	// Double-check: reject if it contains any numbers
-	if regexp.MustCompile(`\d`).MatchString(name) {
-		log.Printf("Candidate %s rejected: contains numbers", name)
-		return ""
-	}
-
-	// Validate: letters only
-	if !regexp.MustCompile(`^[a-zA-Z\s]+$`).MatchString(name) {
-		log.Printf("Name %s rejected: contains invalid characters", name)
-		return ""
-	}
-
-	log.Printf("Final name for %s: %s", url, name)
-	return name
 }
 
 func queueDownloads(c *gin.Context) {
@@ -639,16 +525,14 @@ func hexToRGB(hex string) (r, g, b int, err error) {
 
 func listPeople(c *gin.Context) {
 	var people []struct {
-		ID               int      `json:"id"`
-		Name             string   `json:"name"`
-		ProfilePhotoPath string   `json:"profilePhotoPath"`
-		PhotoCount       int      `json:"photoCount"`
-		GalleryCount     int      `json:"galleryCount"` // New field
-		Aliases          []string `json:"aliases"`
+		ID           int      `json:"id"`
+		Name         string   `json:"name"`
+		PhotoCount   int      `json:"photoCount"`
+		GalleryCount int      `json:"galleryCount"` // New field
+		Aliases      []string `json:"aliases"`
 	}
 	rows, err := db.Query(`
         SELECT p.id, p.name, 
-               COALESCE(p.profile_photo_path, '') as profile_photo_path, 
                COUNT(pt.photo_path) as photo_count,
                COUNT(DISTINCT ph.request_id) as gallery_count,
                (SELECT GROUP_CONCAT(alias, ',') 
@@ -658,7 +542,7 @@ func listPeople(c *gin.Context) {
         FROM people p
         LEFT JOIN photo_tags pt ON p.id = pt.person_id
         LEFT JOIN photos ph ON pt.photo_path = ph.file_path
-        GROUP BY p.id, p.name, COALESCE(p.profile_photo_path, '')
+        GROUP BY p.id, p.name
         ORDER BY p.name`)
 	if err != nil {
 		log.Printf("Query failed: %v", err)
@@ -669,15 +553,14 @@ func listPeople(c *gin.Context) {
 
 	for rows.Next() {
 		var p struct {
-			ID               int      `json:"id"`
-			Name             string   `json:"name"`
-			ProfilePhotoPath string   `json:"profilePhotoPath"`
-			PhotoCount       int      `json:"photoCount"`
-			GalleryCount     int      `json:"galleryCount"`
-			Aliases          []string `json:"aliases"`
+			ID           int      `json:"id"`
+			Name         string   `json:"name"`
+			PhotoCount   int      `json:"photoCount"`
+			GalleryCount int      `json:"galleryCount"`
+			Aliases      []string `json:"aliases"`
 		}
 		var aliases sql.NullString
-		err := rows.Scan(&p.ID, &p.Name, &p.ProfilePhotoPath, &p.PhotoCount, &p.GalleryCount, &aliases)
+		err := rows.Scan(&p.ID, &p.Name, &p.PhotoCount, &p.GalleryCount, &aliases)
 		if err != nil {
 			log.Printf("Scan failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

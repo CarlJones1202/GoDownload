@@ -27,6 +27,8 @@ func initDB() *sql.DB {
 	if err != nil {
 		log.Fatal(err)
 	}
+	_, err = db.Exec("DROP TABLE photo_tags")
+	_, err = db.Exec("DROP TABLE people")
 
 	_, err = db.Exec(`
         CREATE TABLE IF NOT EXISTS requests (
@@ -43,19 +45,6 @@ func initDB() *sql.DB {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (request_id) REFERENCES requests(id)
         );
-        CREATE TABLE IF NOT EXISTS people (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE,
-            profile_photo_path TEXT,
-            FOREIGN KEY (profile_photo_path) REFERENCES photos(file_path)
-        );
-        CREATE TABLE IF NOT EXISTS photo_tags (
-            photo_path TEXT,
-            person_id INTEGER,
-            FOREIGN KEY (photo_path) REFERENCES photos(file_path),
-            FOREIGN KEY (person_id) REFERENCES people(id),
-            PRIMARY KEY (photo_path, person_id)
-        );
         CREATE TABLE IF NOT EXISTS photo_colors (
             photo_path TEXT,
             color_hex TEXT,
@@ -67,7 +56,17 @@ func initDB() *sql.DB {
             alias TEXT,
             FOREIGN KEY (person_id) REFERENCES people(id),
             PRIMARY KEY (person_id, alias)
-        )`)
+        );
+		CREATE TABLE IF NOT EXISTS people (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			aliases TEXT DEFAULT '[]' -- JSON array
+		);
+		CREATE TABLE IF NOT EXISTS photo_tags (
+			photo_path TEXT NOT NULL,
+			person_id INTEGER NOT NULL,
+			FOREIGN KEY (person_id) REFERENCES people(id)
+		);`)
 	if err != nil {
 		log.Fatal(err)
 	}
