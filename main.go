@@ -37,6 +37,11 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
+type UpdatePersonRequest struct {
+	Name    string   `json:"name" binding:"required"`
+	Aliases []string `json:"aliases" binding:"required"` // Require aliases to ensure we always set them
+}
+
 func main() {
 	if err := os.MkdirAll(downloadDir, os.ModePerm); err != nil {
 		log.Fatalf("Failed to create download directory: %v", err)
@@ -52,7 +57,7 @@ func main() {
 		}
 	}()
 	go taggingService()
-	go colorExtractionService()
+	// go colorExtractionService()
 	go processPendingDownloads() // New background service
 
 	r := gin.Default()
@@ -61,14 +66,13 @@ func main() {
 	r.POST("/download", queueDownloads)
 	r.GET("/photos", listPhotos)
 	r.GET("/people", listPeople)
-	r.PUT("/people/:id", updatePersonName)
+	r.PUT("/people/:id", updatePerson)
 	r.POST("/people/combine", combinePeople)
 	r.GET("/people/:id/photos", listPersonPhotos)
 	r.POST("/people/:id/alias", addAlias)
 	r.POST("/people/:id/profile-photo", setProfilePhoto)
 	r.GET("/people/search", searchStashDBPeople)
 	r.POST("/people", addPerson)
-	r.POST("/photos/:path/tag", tagPhoto)
 	r.GET("/galleries", listGalleries)
 	r.GET("/ws", handleWebSocket)
 
@@ -76,38 +80,93 @@ func main() {
 }
 
 func addPerson(c *gin.Context) {
-	var p Person
-	if err := c.ShouldBindJSON(&p); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+	var req Person
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body: " + err.Error()})
 		return
 	}
 
-	aliasesJSON, _ := json.Marshal(p.Aliases)
-	result, err := db.Exec("INSERT INTO people (name, aliases) VALUES (?, ?)", p.Name, aliasesJSON)
+	// Default to empty slice if aliases is nil
+	if req.Aliases == nil {
+		req.Aliases = []string{}
+	}
+
+	aliasesJSON, err := json.Marshal(req.Aliases)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add person"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to encode aliases"})
 		return
 	}
-	id, _ := result.LastInsertId()
-	p.ID = int(id)
 
-	c.JSON(http.StatusOK, p)
+	result, err := db.Exec("INSERT INTO people (name, aliases) VALUES (?, ?)", req.Name, aliasesJSON)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add person: " + err.Error()})
+		return
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get person ID"})
+		return
+	}
+
+	person := Person{
+		ID:      int(id),
+		Name:    req.Name,
+		Aliases: req.Aliases,
+	}
+	c.JSON(http.StatusOK, person)
 }
 
-func tagPhoto(c *gin.Context) {
-	path := c.Param("path")
-	var req TagRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+func updatePerson(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid person ID"})
 		return
 	}
 
-	_, err := db.Exec("INSERT INTO photo_tags (photo_path, person_id) VALUES (?, ?)", path, req.PersonID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to tag photo"})
+	var req UpdatePersonRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body: " + err.Error()})
 		return
 	}
-	c.Status(http.StatusOK)
+
+	if req.Aliases == nil {
+		log.Printf("Defaulting to empty alias list for person %d", id)
+		req.Aliases = []string{}
+	} else {
+		log.Printf("Added %v aliases to person %d", req.Aliases, id)
+	}
+
+	aliasesJSON, err := json.Marshal(req.Aliases)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to encode aliases"})
+		return
+	}
+
+	result, err := db.Exec("UPDATE people SET name = ?, aliases = ? WHERE id = ?", req.Name, aliasesJSON, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update person: " + err.Error()})
+		return
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check update result"})
+		return
+	}
+	if rowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Person not found"})
+		return
+	}
+
+	log.Printf("Person %d, updated", id)
+
+	person := Person{
+		ID:      id,
+		Name:    req.Name,
+		Aliases: req.Aliases,
+	}
+	c.JSON(http.StatusOK, person)
 }
 
 func processPendingDownloads() {
@@ -329,42 +388,6 @@ func queueDownloads(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Download queued"})
 }
 
-func updatePersonName(c *gin.Context) {
-	personID, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid person ID"})
-		return
-	}
-
-	var req struct {
-		Name string `json:"name" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Name is required"})
-		return
-	}
-
-	// Check if person exists
-	var exists int
-	err = db.QueryRow("SELECT COUNT(*) FROM people WHERE id = ?", personID).Scan(&exists)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	if exists == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Person not found"})
-		return
-	}
-
-	_, err = db.Exec("UPDATE people SET name = ? WHERE id = ?", req.Name, personID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "Name updated successfully"})
-}
-
 func listPhotos(c *gin.Context) {
 	pageStr := c.DefaultQuery("page", "1")
 	perPageStr := c.DefaultQuery("per_page", "50")
@@ -524,21 +547,12 @@ func hexToRGB(hex string) (r, g, b int, err error) {
 }
 
 func listPeople(c *gin.Context) {
-	var people []struct {
-		ID           int      `json:"id"`
-		Name         string   `json:"name"`
-		PhotoCount   int      `json:"photoCount"`
-		GalleryCount int      `json:"galleryCount"` // New field
-		Aliases      []string `json:"aliases"`
-	}
+	var people []Person
 	rows, err := db.Query(`
         SELECT p.id, p.name, 
                COUNT(pt.photo_path) as photo_count,
                COUNT(DISTINCT ph.request_id) as gallery_count,
-               (SELECT GROUP_CONCAT(alias, ',') 
-                FROM (SELECT DISTINCT a.alias 
-                      FROM aliases a 
-                      WHERE a.person_id = p.id)) as aliases
+               p.aliases
         FROM people p
         LEFT JOIN photo_tags pt ON p.id = pt.person_id
         LEFT JOIN photos ph ON pt.photo_path = ph.file_path
@@ -552,24 +566,23 @@ func listPeople(c *gin.Context) {
 	defer rows.Close()
 
 	for rows.Next() {
-		var p struct {
-			ID           int      `json:"id"`
-			Name         string   `json:"name"`
-			PhotoCount   int      `json:"photoCount"`
-			GalleryCount int      `json:"galleryCount"`
-			Aliases      []string `json:"aliases"`
-		}
-		var aliases sql.NullString
-		err := rows.Scan(&p.ID, &p.Name, &p.PhotoCount, &p.GalleryCount, &aliases)
+		var p Person
+		var aliasesJSON sql.NullString
+		err := rows.Scan(&p.ID, &p.Name, &p.PhotoCount, &p.GalleryCount, &aliasesJSON)
 		if err != nil {
 			log.Printf("Scan failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		if aliases.Valid {
-			p.Aliases = strings.Split(aliases.String, ",")
+
+		if aliasesJSON.Valid && aliasesJSON.String != "" && aliasesJSON.String != `""` {
+			if err := json.Unmarshal([]byte(aliasesJSON.String), &p.Aliases); err != nil {
+				log.Printf("Failed to unmarshal aliases '%s' for %s (ID: %d): %v", aliasesJSON.String, p.Name, p.ID, err)
+				p.Aliases = []string{}
+			}
 		} else {
 			p.Aliases = []string{}
+			log.Printf("Aliases for %s (ID: %d) is empty, NULL, or quotes-only: '%s'", p.Name, p.ID, aliasesJSON.String)
 		}
 		people = append(people, p)
 	}
@@ -578,6 +591,8 @@ func listPeople(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+
+	log.Printf("Returning %d people", len(people))
 	c.JSON(http.StatusOK, people)
 }
 
@@ -817,7 +832,7 @@ func checkAndRedownloadMissingFiles() error {
 	}
 	var photos []photo
 
-	rows, err := db.Query("SELECT url, file_path FROM photos")
+	rows, err := db.Query("SELECT url, file_path FROM photos ORDER BY created_at DESC")
 	if err != nil {
 		return fmt.Errorf("querying photos: %v", err)
 	}

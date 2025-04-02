@@ -27,9 +27,6 @@ func initDB() *sql.DB {
 	if err != nil {
 		log.Fatal(err)
 	}
-	_, err = db.Exec("DROP TABLE photo_tags")
-	_, err = db.Exec("DROP TABLE people")
-
 	_, err = db.Exec(`
         CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
