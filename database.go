@@ -57,7 +57,8 @@ func initDB() *sql.DB {
 		CREATE TABLE IF NOT EXISTS people (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL,
-			aliases TEXT DEFAULT '[]' -- JSON array
+			aliases TEXT DEFAULT '[]', -- JSON array
+			profile_photo_id INTEGER
 		);
 		CREATE TABLE IF NOT EXISTS photo_tags (
 			photo_path TEXT NOT NULL,

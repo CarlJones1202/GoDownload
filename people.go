@@ -8,13 +8,21 @@ import (
 	"strings"
 )
 
-type Person struct {
-	ID           int      `db:"id"`
-	Name         string   `db:"name" json:"name"`
-	PhotoCount   int      `json:"photoCount"`
-	GalleryCount int      `json:"galleryCount"`
-	Aliases      []string `db:"aliases" json:"aliases"` // Changed to []string
+type PhotoSummary struct {
+	ID        int    `json:"id"`
+	Thumbnail string `json:"thumbnailPath"`
 }
+
+type Person struct {
+	ID           int           `json:"id"`
+	Name         string        `json:"name"`
+	Aliases      []string      `json:"aliases"`
+	PhotoCount   int           `json:"photoCount,omitempty"`
+	GalleryCount int           `json:"galleryCount,omitempty"`
+	ProfilePhoto *PhotoSummary `json:"profilePhoto,omitempty"`
+}
+
+var ErrNoPersonMatch = fmt.Errorf("no matching people found in URL")
 
 func processPhotoForTagging(photoPath string) error {
 	var galleryURL string
@@ -26,15 +34,14 @@ func processPhotoForTagging(photoPath string) error {
 	if err != nil {
 		return fmt.Errorf("fetching gallery URL for %s: %v", photoPath, err)
 	}
-	log.Printf("Processing photo %s with gallery URL: %s", photoPath, galleryURL)
 
 	matchedPersonIDs, err := extractPersonIDsFromURL(galleryURL)
 	if err != nil {
 		return fmt.Errorf("extracting person IDs from URL %s: %v", galleryURL, err)
 	}
 	if len(matchedPersonIDs) == 0 {
-		log.Printf("No matching people found in URL %s", galleryURL)
-		return nil
+		// Don't log, just return the sentinel error
+		return ErrNoPersonMatch
 	}
 
 	for _, personID := range matchedPersonIDs {

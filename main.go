@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/disintegration/imaging"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -40,6 +42,7 @@ var upgrader = websocket.Upgrader{
 type UpdatePersonRequest struct {
 	Name    string   `json:"name" binding:"required"`
 	Aliases []string `json:"aliases" binding:"required"` // Require aliases to ensure we always set them
+	PhotoId *int     `json:"photoId,omitempty"`
 }
 
 func main() {
@@ -75,6 +78,7 @@ func main() {
 	r.POST("/people", addPerson)
 	r.GET("/galleries", listGalleries)
 	r.GET("/ws", handleWebSocket)
+	r.DELETE("/galleries/:id", deleteGallery) // Route for deleting galleries
 
 	log.Fatal(r.Run(":8081"))
 }
@@ -131,10 +135,7 @@ func updatePerson(c *gin.Context) {
 	}
 
 	if req.Aliases == nil {
-		log.Printf("Defaulting to empty alias list for person %d", id)
 		req.Aliases = []string{}
-	} else {
-		log.Printf("Added %v aliases to person %d", req.Aliases, id)
 	}
 
 	aliasesJSON, err := json.Marshal(req.Aliases)
@@ -143,29 +144,44 @@ func updatePerson(c *gin.Context) {
 		return
 	}
 
-	result, err := db.Exec("UPDATE people SET name = ?, aliases = ? WHERE id = ?", req.Name, aliasesJSON, id)
+	var profilePhotoID *int
+	if req.PhotoId != nil {
+		// Validate the photo belongs to this person
+		var count int
+		err := db.QueryRow(`
+            SELECT COUNT(*) FROM photos p
+            JOIN photo_tags pt ON p.file_path = pt.photo_path
+            WHERE p.id = ? AND pt.person_id = ?`, *req.PhotoId, id).Scan(&count)
+		if err != nil || count == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Photo not found or not tagged with this person"})
+			return
+		}
+		profilePhotoID = req.PhotoId
+	}
+
+	// Build update query
+	if profilePhotoID != nil {
+		_, err = db.Exec("UPDATE people SET name = ?, aliases = ?, profile_photo_id = ? WHERE id = ?", req.Name, aliasesJSON, *profilePhotoID, id)
+	} else {
+		_, err = db.Exec("UPDATE people SET name = ?, aliases = ? WHERE id = ?", req.Name, aliasesJSON, id)
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update person: " + err.Error()})
 		return
 	}
 
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check update result"})
-		return
+	// Materialize profilePhotoPath for response
+	var profilePhotoPath string
+	if profilePhotoID != nil {
+		_ = db.QueryRow("SELECT file_path FROM photos WHERE request_id = ?", *profilePhotoID).Scan(&profilePhotoPath)
 	}
-	if rowsAffected == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Person not found"})
-		return
-	}
-
-	log.Printf("Person %d, updated", id)
 
 	person := Person{
 		ID:      id,
 		Name:    req.Name,
 		Aliases: req.Aliases,
 	}
+
 	c.JSON(http.StatusOK, person)
 }
 
@@ -183,7 +199,6 @@ func processPendingDownloads() {
 		hasNext := rows.Next()
 		if !hasNext {
 			rows.Close()
-			log.Printf("No pending downloads, waiting...")
 			time.Sleep(10 * time.Second)
 			continue
 		}
@@ -225,7 +240,6 @@ func processPendingDownloads() {
 	}
 }
 
-// New color extraction service
 func colorExtractionService() {
 	for {
 		rows, err := db.Query(`
@@ -258,13 +272,11 @@ func colorExtractionService() {
 					log.Printf("Error extracting colors for %s: %v", photoPath, err)
 				}
 			default:
-				log.Printf("Color channel empty before processing all %d photos", photoCount)
 				break
 			}
 		}
 
 		if photoCount == 0 {
-			log.Printf("No photos needing color extraction, waiting...")
 			time.Sleep(10 * time.Second)
 		}
 	}
@@ -316,21 +328,18 @@ func extractAndStoreColors(filePath string) error {
 // Background service to tag photos
 func taggingService() {
 	for {
-		log.Printf("checking for untagged photos")
-		// Fetch untagged photos
 		rows, err := db.Query(`
-			SELECT p.file_path, r.url 
-			FROM photos p 
-			JOIN requests r ON p.request_id = r.id 
-			WHERE p.file_path NOT IN (SELECT photo_path FROM photo_tags) 
-			LIMIT 10`)
+            SELECT p.file_path, r.url 
+            FROM photos p 
+            JOIN requests r ON p.request_id = r.id 
+            WHERE p.file_path NOT IN (SELECT photo_path FROM photo_tags) 
+            LIMIT 10`)
 		if err != nil {
 			log.Printf("Error querying untagged photos: %v", err)
 			time.Sleep(10 * time.Second)
 			continue
 		}
 
-		// Queue all fetched photos
 		photoCount := 0
 		for rows.Next() {
 			var filePath, galleryURL string
@@ -343,23 +352,22 @@ func taggingService() {
 		}
 		rows.Close()
 
-		// Process all queued photos in this batch
 		for i := 0; i < photoCount; i++ {
 			select {
 			case photoPath := <-photoChan:
-				if err := processPhotoForTagging(photoPath); err != nil {
+				err := processPhotoForTagging(photoPath)
+				if err != nil && err != ErrNoPersonMatch {
 					log.Printf("Error processing photo %s: %v", photoPath, err)
+				} else if err == ErrNoPersonMatch {
+					log.Printf("No matching person found for photo %s, will retry later", photoPath)
 				}
+				// If ErrNoPersonMatch, do nothing: it will be retried next time
 			default:
-				// If channel is empty prematurely, break out
-				log.Printf("Channel empty before processing all %d photos", photoCount)
 				break
 			}
 		}
 
-		// If no photos were queued, wait before checking again
 		if photoCount == 0 {
-			log.Printf("No untagged photos found, waiting...")
 			time.Sleep(10 * time.Second)
 		} else {
 			time.Sleep(2 * time.Second)
@@ -376,7 +384,28 @@ func queueDownloads(c *gin.Context) {
 		return
 	}
 
-	// Insert into requests table with pending status
+	if strings.HasSuffix(req.URL, "[range]") {
+		baseUrl := strings.TrimSuffix(req.URL, "[range]")
+		postUrls, err := enumerateAllPostUrls(baseUrl)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to enumerate posts: " + err.Error()})
+			return
+		}
+		count := 0
+		for _, postUrl := range postUrls {
+			_, err := db.Exec(
+				"INSERT INTO requests (url, created_at, status) VALUES (?, ?, 'pending') ON CONFLICT(url) DO NOTHING",
+				postUrl, time.Now().Format(time.RFC3339),
+			)
+			if err == nil {
+				count++
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("Queued %d posts for download", count)})
+		return
+	}
+
+	// Single post as before
 	_, err := db.Exec(
 		"INSERT INTO requests (url, created_at, status) VALUES (?, ?, 'pending') ON CONFLICT(url) DO NOTHING",
 		req.URL, time.Now().Format(time.RFC3339),
@@ -387,6 +416,59 @@ func queueDownloads(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Download queued"})
+}
+
+// Helper: enumerate all post URLs in a thread (across all pages)
+func enumerateAllPostUrls(baseUrl string) ([]string, error) {
+	var postUrls []string
+	seen := make(map[string]bool)
+	page := 1
+	for {
+		pageUrl := baseUrl
+		if page > 1 {
+			if strings.Contains(baseUrl, "?") {
+				pageUrl = fmt.Sprintf("%s&page=%d", baseUrl, page)
+			} else {
+				pageUrl = fmt.Sprintf("%s/page%d", strings.TrimRight(baseUrl, "/"), page)
+			}
+		}
+		resp, err := http.Get(pageUrl)
+		if err != nil {
+			return nil, fmt.Errorf("fetching %s: %v", pageUrl, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("reading %s: %v", pageUrl, err)
+		}
+		doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+		if err != nil {
+			return nil, fmt.Errorf("parsing HTML from %s: %v", pageUrl, err)
+		}
+
+		foundNew := false
+		doc.Find("div[id^='post_message_']").Each(func(_ int, s *goquery.Selection) {
+			id, exists := s.Attr("id")
+			if !exists || seen[id] {
+				return
+			}
+			seen[id] = true
+			foundNew = true
+			// Compose post URL using the actual pageUrl (not baseUrl)
+			postUrl := pageUrl
+			if strings.Contains(pageUrl, "#") {
+				postUrl = strings.Split(pageUrl, "#")[0]
+			}
+			postUrl = fmt.Sprintf("%s#%s", postUrl, id)
+			postUrls = append(postUrls, postUrl)
+		})
+
+		if !foundNew {
+			break // No new posts found, stop
+		}
+		page++
+	}
+	return postUrls, nil
 }
 
 func listPhotos(c *gin.Context) {
@@ -407,6 +489,7 @@ func listPhotos(c *gin.Context) {
 	}
 
 	type PhotoWithTagsAndColors struct {
+		Id        int      `json:"id"`
 		RequestID int      `json:"RequestId"`
 		URL       string   `json:"URL"`
 		Path      string   `json:"Path"`
@@ -417,7 +500,7 @@ func listPhotos(c *gin.Context) {
 	}
 
 	query := `
-        SELECT p.request_id, p.url, p.file_path, p.thumbnail_path, p.created_at, 
+        SELECT p.id, p.request_id, p.url, p.file_path, p.thumbnail_path, p.created_at, 
                GROUP_CONCAT(pe.name, ','), GROUP_CONCAT(pc.color_hex, ',') 
         FROM photos p 
         LEFT JOIN photo_tags pt ON p.file_path = pt.photo_path 
@@ -497,7 +580,7 @@ func listPhotos(c *gin.Context) {
 	for rows.Next() {
 		var p PhotoWithTagsAndColors
 		var tags, colors sql.NullString
-		if err := rows.Scan(&p.RequestID, &p.URL, &p.Path, &p.Thumbnail, &p.CreatedAt, &tags, &colors); err != nil {
+		if err := rows.Scan(&p.Id, &p.RequestID, &p.URL, &p.Path, &p.Thumbnail, &p.CreatedAt, &tags, &colors); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
@@ -553,7 +636,8 @@ func listPeople(c *gin.Context) {
         SELECT p.id, p.name, 
                COUNT(pt.photo_path) as photo_count,
                COUNT(DISTINCT ph.request_id) as gallery_count,
-               p.aliases
+               p.aliases,
+               p.profile_photo_id
         FROM people p
         LEFT JOIN photo_tags pt ON p.id = pt.person_id
         LEFT JOIN photos ph ON pt.photo_path = ph.file_path
@@ -569,7 +653,8 @@ func listPeople(c *gin.Context) {
 	for rows.Next() {
 		var p Person
 		var aliasesJSON sql.NullString
-		err := rows.Scan(&p.ID, &p.Name, &p.PhotoCount, &p.GalleryCount, &aliasesJSON)
+		var profilePhotoID sql.NullInt64
+		err := rows.Scan(&p.ID, &p.Name, &p.PhotoCount, &p.GalleryCount, &aliasesJSON, &profilePhotoID)
 		if err != nil {
 			log.Printf("Scan failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -583,7 +668,18 @@ func listPeople(c *gin.Context) {
 			}
 		} else {
 			p.Aliases = []string{}
-			log.Printf("Aliases for %s (ID: %d) is empty, NULL, or quotes-only: '%s'", p.Name, p.ID, aliasesJSON.String)
+		}
+
+		if profilePhotoID.Valid {
+			var thumbPath string
+			var id int
+			err := db.QueryRow("SELECT id, thumbnail_path FROM photos WHERE id = ?", int(profilePhotoID.Int64)).Scan(&id, &thumbPath)
+			if err == nil {
+				p.ProfilePhoto = &PhotoSummary{
+					ID:        id,
+					Thumbnail: thumbPath,
+				}
+			}
 		}
 		people = append(people, p)
 	}
@@ -913,7 +1009,6 @@ func checkAndRedownloadMissingFiles() error {
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("reading rows: %v", err)
 	}
-	// rows.Close() is called via defer, releasing the DB connection here
 
 	// Filter missing files
 	var tasks []photo
@@ -924,7 +1019,6 @@ func checkAndRedownloadMissingFiles() error {
 	}
 
 	if len(tasks) == 0 {
-		log.Printf("No missing files to redownload")
 		return nil
 	}
 
@@ -990,6 +1084,7 @@ func checkAndRedownloadMissingFiles() error {
 	log.Printf("Completed redownloading %d files", len(tasks))
 	return nil
 }
+
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1016,4 +1111,65 @@ type Gallery struct {
 	URL       string `json:"url"`
 	CreatedAt string `json:"createdAt"`
 	Thumbnail string `json:"thumbnail,omitempty"`
+}
+
+func deleteGallery(c *gin.Context) {
+	galleryIDStr := c.Param("id")
+	galleryID, err := strconv.Atoi(galleryIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid gallery id"})
+		return
+	}
+
+	// Get all photo file paths for this gallery
+	rows, err := db.Query("SELECT file_path, thumbnail_path FROM photos WHERE request_id = ?", galleryID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query photos: " + err.Error()})
+		return
+	}
+	var filePaths []string
+	var thumbPaths []string
+	for rows.Next() {
+		var filePath, thumbPath string
+		if err := rows.Scan(&filePath, &thumbPath); err == nil {
+			filePaths = append(filePaths, filePath)
+			thumbPaths = append(thumbPaths, thumbPath)
+		}
+	}
+	rows.Close()
+
+	// Delete photo files and thumbnails from disk
+	for _, fp := range filePaths {
+		_ = os.Remove(fp)
+	}
+	for _, tp := range thumbPaths {
+		_ = os.Remove(tp)
+	}
+
+	// Optionally, remove empty directories (best effort)
+	if len(filePaths) > 0 {
+		dir := filepath.Dir(filePaths[0])
+		_ = os.RemoveAll(filepath.Join(dir, "thumbnails"))
+		_ = os.Remove(dir)
+	}
+
+	// Delete from DB (photos, tags, colors, etc.)
+	tx, err := db.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction: " + err.Error()})
+		return
+	}
+	defer tx.Rollback()
+
+	_, _ = tx.Exec("DELETE FROM photo_tags WHERE photo_path IN (SELECT file_path FROM photos WHERE request_id = ?)", galleryID)
+	_, _ = tx.Exec("DELETE FROM photo_colors WHERE photo_path IN (SELECT file_path FROM photos WHERE request_id = ?)", galleryID)
+	_, _ = tx.Exec("DELETE FROM photos WHERE request_id = ?", galleryID)
+	_, _ = tx.Exec("DELETE FROM requests WHERE id = ?", galleryID)
+
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Gallery and all photos deleted"})
 }

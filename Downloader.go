@@ -17,39 +17,6 @@ import (
 
 func DownloadGallery(requestURL, targetUrl, title string) error {
 	fmt.Printf("Starting DownloadGallery for %s (title: %s)\n", targetUrl, title)
-
-	// Check for [range] at the end of the URL
-	if strings.HasSuffix(targetUrl, "[range]") {
-		baseUrl := strings.TrimSuffix(targetUrl, "[range]")
-		processedPosts := make(map[string]bool)
-		page := 1
-		for {
-			pageUrl := baseUrl
-			if page > 1 {
-				if strings.Contains(baseUrl, "?") {
-					pageUrl = fmt.Sprintf("%s&page=%d", baseUrl, page)
-				} else {
-					pageUrl = fmt.Sprintf("%s/page%d", strings.TrimRight(baseUrl, "/"), page)
-				}
-			}
-			fmt.Printf("Processing page %d: %s\n", page, pageUrl)
-			newPosts, done, err := processGalleryPage(requestURL, pageUrl, title, processedPosts)
-			if err != nil {
-				return err
-			}
-			if done || len(newPosts) == 0 {
-				fmt.Println("No new posts found or already processed, stopping.")
-				break
-			}
-			for _, pid := range newPosts {
-				processedPosts[pid] = true
-			}
-			page++
-		}
-		return nil
-	}
-
-	// Default: single page
 	_, _, err := processGalleryPage(requestURL, targetUrl, title, nil)
 	return err
 }
@@ -145,30 +112,47 @@ func processGalleryPage(requestURL, targetUrl, title string, processedPosts map[
 		return nil, false, fmt.Errorf("parsing HTML from %s: %v", targetUrl, err)
 	}
 
-	tempTarget := targetUrl
-	if strings.Contains(tempTarget, "/page") {
-		tempTarget = strings.Split(targetUrl, "/page")[0]
+	// Determine the main gallery folder (strip /pageN and #post)
+	mainUrl := targetUrl
+	if idx := strings.Index(mainUrl, "/page"); idx != -1 {
+		mainUrl = mainUrl[:idx]
 	}
-	fmt.Printf("Base target URL: %s\n", tempTarget)
-
-	u, err := url.Parse(tempTarget)
+	if idx := strings.Index(mainUrl, "#"); idx != -1 {
+		mainUrl = mainUrl[:idx]
+	}
+	u, err := url.Parse(mainUrl)
 	if err != nil {
-		return nil, false, fmt.Errorf("parsing URL %s: %v", targetUrl, err)
+		return nil, false, fmt.Errorf("parsing URL %s: %v", mainUrl, err)
 	}
 	u.RawQuery = ""
-	fmt.Printf("Parsed URL path: %s\n", u.Path)
+	mainGalleryDir := downloadDir + "/" + sanitizeFolderName(path.Base(u.Path))
+	if title != "" {
+		mainGalleryDir += "-" + title
+	}
 
-	postId := "post_message_"
+	// Get post ID for subfolder
+	postId := ""
 	if strings.Contains(targetUrl, "#post") {
 		split := strings.Split(targetUrl, "#post")
-		postId += split[len(split)-1]
+		postId = "post" + split[len(split)-1]
 	}
-	fmt.Printf("Targeting post ID: %s\n", postId)
+	if postId == "" {
+		// fallback: try to find the first post_message_ div
+		doc.Find("div[id^='post_message_']").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+			id, exists := s.Attr("id")
+			if exists {
+				postId = id
+				return false // break
+			}
+			return true
+		})
+	}
+	if postId == "" {
+		return nil, false, fmt.Errorf("could not determine post ID for %s", targetUrl)
+	}
 
-	directory := downloadDir + "/" + sanitizeFolderName(path.Base(u.Path))
-	if title != "" {
-		directory += "-" + title
-	}
+	// Use subfolder for this post
+	directory := fmt.Sprintf("%s/%s", mainGalleryDir, postId)
 	fmt.Printf("Creating directory: %s\n", directory)
 	if err := os.MkdirAll(directory, os.ModePerm); err != nil {
 		return nil, false, fmt.Errorf("creating directory %s: %v", directory, err)
