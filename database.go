@@ -19,10 +19,12 @@ type Photo struct {
 var db *sql.DB
 
 func initDB() *sql.DB {
-	db, err := sql.Open("sqlite", "./gallery.db")
+	db, err := sql.Open("sqlite", "./gallery.db?_busy_timeout=5000")
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	db.Exec("PRAGMA journal_mode=WAL;")
 
 	if err != nil {
 		log.Fatal(err)

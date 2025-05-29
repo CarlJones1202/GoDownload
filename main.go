@@ -78,7 +78,8 @@ func main() {
 	r.POST("/people", addPerson)
 	r.GET("/galleries", listGalleries)
 	r.GET("/ws", handleWebSocket)
-	r.DELETE("/galleries/:id", deleteGallery) // Route for deleting galleries
+	r.DELETE("/galleries/:id", deleteGallery)                     // Route for deleting galleries
+	r.POST("/galleries/:id/assign-person", assignPersonToGallery) // Route for assigning person to gallery
 
 	log.Fatal(r.Run(":8081"))
 }
@@ -1172,4 +1173,54 @@ func deleteGallery(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Gallery and all photos deleted"})
+}
+
+func assignPersonToGallery(c *gin.Context) {
+	log.Printf("Assigning person to gallery")
+	galleryIDStr := c.Param("id")
+	galleryID, err := strconv.Atoi(galleryIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid gallery id"})
+		return
+	}
+
+	var req struct {
+		PersonID int `json:"personId"`
+	}
+	log.Printf("Assigning person to gallery %d", galleryID)
+	if err := c.ShouldBindJSON(&req); err != nil || req.PersonID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing or invalid personId"})
+		return
+	}
+
+	// Get all photo file paths for this gallery
+	rows, err := db.Query("SELECT file_path FROM photos WHERE request_id = ?", galleryID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query photos: " + err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	log.Printf("Assigning person %d to gallery %d", req.PersonID, galleryID)
+
+	count := 0
+	for rows.Next() {
+		var filePath string
+		if err := rows.Scan(&filePath); err == nil {
+			_, err := db.Exec(
+				"INSERT OR IGNORE INTO photo_tags (photo_path, person_id) VALUES (?, ?)",
+				filePath, req.PersonID,
+			)
+			if err == nil {
+				count++
+			} else {
+				log.Printf("Failed to tag photo %s: %v", filePath, err)
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "Person assigned to gallery",
+		"photosTagged": count,
+	})
 }
