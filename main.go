@@ -316,6 +316,7 @@ func extractAndStoreColors(filePath string) error {
 // Background service to tag photos
 func taggingService() {
 	for {
+		log.Printf("checking for untagged photos")
 		// Fetch untagged photos
 		rows, err := db.Query(`
 			SELECT p.file_path, r.url 
@@ -727,17 +728,21 @@ func setProfilePhoto(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Profile photo updated"})
 }
 
+type GalleryWithPeople struct {
+	ID        int      `json:"id"`
+	URL       string   `json:"url"`
+	CreatedAt string   `json:"createdAt"`
+	Thumbnail string   `json:"thumbnail,omitempty"`
+	People    []Person `json:"people"`
+}
+
 func listGalleries(c *gin.Context) {
 	personIDStr := c.Query("person_id")
 
-	var galleries []struct {
-		ID        int    `json:"id"`
-		URL       string `json:"url"`
-		CreatedAt string `json:"createdAt"`
-	}
+	var galleries []GalleryWithPeople
 
 	query := `
-        SELECT DISTINCT r.id, r.url, r.created_at
+        SELECT DISTINCT r.id, r.url, r.created_at, MIN(p.thumbnail_path) as thumbnail
         FROM requests r
         JOIN photos p ON r.id = p.request_id
     `
@@ -750,39 +755,99 @@ func listGalleries(c *gin.Context) {
 			return
 		}
 		query += `
-            JOIN photo_tags pt ON p.file_path = pt.photo_path
-            WHERE pt.person_id = ?
-        `
+			JOIN photo_tags pt ON p.file_path = pt.photo_path
+			WHERE pt.person_id = ?
+		`
 		args = append(args, personID)
 	}
 
-	query += " ORDER BY r.created_at DESC"
+	query += `
+		GROUP BY r.id, r.url, r.created_at
+		ORDER BY r.created_at DESC
+	`
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
+		log.Printf("Query failed: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
 
+	galleryMap := make(map[int]*GalleryWithPeople)
+	var galleryIDs []int
+
 	for rows.Next() {
-		var g struct {
-			ID        int    `json:"id"`
-			URL       string `json:"url"`
-			CreatedAt string `json:"createdAt"`
-		}
-		if err := rows.Scan(&g.ID, &g.URL, &g.CreatedAt); err != nil {
+		var g GalleryWithPeople
+		var thumbnail sql.NullString
+		if err := rows.Scan(&g.ID, &g.URL, &g.CreatedAt, &thumbnail); err != nil {
+			log.Printf("Scan failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+		if thumbnail.Valid {
+			g.Thumbnail = thumbnail.String
+		}
+		g.People = []Person{}
 		galleries = append(galleries, g)
+		galleryMap[g.ID] = &galleries[len(galleries)-1]
+		galleryIDs = append(galleryIDs, g.ID)
 	}
 
-	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	if len(galleryIDs) == 0 {
+		c.JSON(http.StatusOK, galleries)
 		return
 	}
 
+	// Fetch all people for all galleries in one query
+	placeholders := make([]string, len(galleryIDs))
+	args2 := make([]interface{}, len(galleryIDs))
+	for i, id := range galleryIDs {
+		placeholders[i] = "?"
+		args2[i] = id
+	}
+	peopleQuery := `
+        SELECT DISTINCT p.request_id, pe.id, pe.name, pe.aliases
+        FROM photos p
+        JOIN photo_tags pt ON p.file_path = pt.photo_path
+        JOIN people pe ON pt.person_id = pe.id
+        WHERE p.request_id IN (` + strings.Join(placeholders, ",") + `)
+    `
+	peopleRows, err := db.Query(peopleQuery, args2...)
+	if err != nil {
+		log.Printf("Error fetching people for galleries: %v", err)
+		// Still return galleries with empty people arrays
+		c.JSON(http.StatusOK, galleries)
+		return
+	}
+	defer peopleRows.Close()
+
+	for peopleRows.Next() {
+		var requestID, personID int
+		var name string
+		var aliasesJSON sql.NullString
+		if err := peopleRows.Scan(&requestID, &personID, &name, &aliasesJSON); err != nil {
+			log.Printf("Error scanning person for gallery %d: %v", requestID, err)
+			continue
+		}
+		var aliases []string
+		if aliasesJSON.Valid && aliasesJSON.String != "" && aliasesJSON.String != `""` {
+			if err := json.Unmarshal([]byte(aliasesJSON.String), &aliases); err != nil {
+				aliases = []string{}
+			}
+		} else {
+			aliases = []string{}
+		}
+		if g, ok := galleryMap[requestID]; ok {
+			g.People = append(g.People, Person{
+				ID:      personID,
+				Name:    name,
+				Aliases: aliases,
+			})
+		}
+	}
+
+	log.Printf("Returning %d galleries", len(galleries))
 	c.JSON(http.StatusOK, galleries)
 }
 
@@ -944,4 +1009,11 @@ func processURL(url string) error {
 		return fmt.Errorf("error downloading gallery %s: %v", url, err)
 	}
 	return nil
+}
+
+type Gallery struct {
+	ID        int    `json:"id"`
+	URL       string `json:"url"`
+	CreatedAt string `json:"createdAt"`
+	Thumbnail string `json:"thumbnail,omitempty"`
 }

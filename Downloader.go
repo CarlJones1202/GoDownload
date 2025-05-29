@@ -18,6 +18,46 @@ import (
 func DownloadGallery(requestURL, targetUrl, title string) error {
 	fmt.Printf("Starting DownloadGallery for %s (title: %s)\n", targetUrl, title)
 
+	// Check for [range] at the end of the URL
+	if strings.HasSuffix(targetUrl, "[range]") {
+		baseUrl := strings.TrimSuffix(targetUrl, "[range]")
+		processedPosts := make(map[string]bool)
+		page := 1
+		for {
+			pageUrl := baseUrl
+			if page > 1 {
+				if strings.Contains(baseUrl, "?") {
+					pageUrl = fmt.Sprintf("%s&page=%d", baseUrl, page)
+				} else {
+					pageUrl = fmt.Sprintf("%s/page%d", strings.TrimRight(baseUrl, "/"), page)
+				}
+			}
+			fmt.Printf("Processing page %d: %s\n", page, pageUrl)
+			newPosts, done, err := processGalleryPage(requestURL, pageUrl, title, processedPosts)
+			if err != nil {
+				return err
+			}
+			if done || len(newPosts) == 0 {
+				fmt.Println("No new posts found or already processed, stopping.")
+				break
+			}
+			for _, pid := range newPosts {
+				processedPosts[pid] = true
+			}
+			page++
+		}
+		return nil
+	}
+
+	// Default: single page
+	_, _, err := processGalleryPage(requestURL, targetUrl, title, nil)
+	return err
+}
+
+// Helper to process a single page and return new post IDs, and whether to stop
+func processGalleryPage(requestURL, targetUrl, title string, processedPosts map[string]bool) ([]string, bool, error) {
+	fmt.Printf("Starting processGalleryPage for %s (title: %s)\n", targetUrl, title)
+
 	client := &http.Client{
 		Timeout: 60 * time.Second,
 		Transport: &http.Transport{
@@ -34,7 +74,7 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 	}
 	req, err := http.NewRequest("GET", targetUrl, nil)
 	if err != nil {
-		return fmt.Errorf("creating request for %s: %v", targetUrl, err)
+		return nil, false, fmt.Errorf("creating request for %s: %v", targetUrl, err)
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0")
 	req.Header.Set("Accept", "*/*")
@@ -59,7 +99,7 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 		if err != nil {
 			fmt.Printf("Request failed: %v\n", err)
 			if attempt == maxRetries {
-				return fmt.Errorf("fetching %s after %d attempts: %v", targetUrl, maxRetries, err)
+				return nil, false, fmt.Errorf("fetching %s after %d attempts: %v", targetUrl, maxRetries, err)
 			}
 			time.Sleep(5 * time.Second)
 			continue
@@ -67,7 +107,7 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 		break
 	}
 	if resp == nil {
-		return fmt.Errorf("no response received for %s after %d attempts", targetUrl, maxRetries)
+		return nil, false, fmt.Errorf("no response received for %s after %d attempts", targetUrl, maxRetries)
 	}
 	defer resp.Body.Close()
 
@@ -83,12 +123,12 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 		} else {
 			fmt.Println("Saved response body to response.html")
 		}
-		return fmt.Errorf("unexpected status %d for %s", resp.StatusCode, targetUrl)
+		return nil, false, fmt.Errorf("unexpected status %d for %s", resp.StatusCode, targetUrl)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("reading response body: %v", err)
+		return nil, false, fmt.Errorf("reading response body: %v", err)
 	}
 	if strings.Contains(string(body), "DDoS-Guard") || strings.Contains(string(body), "Checking your browser") {
 		fmt.Println("DDoS-Guard protection detected. Please update cookies from your browser.")
@@ -97,12 +137,12 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 		} else {
 			fmt.Println("Saved DDoS-Guard response to response.html")
 		}
-		return fmt.Errorf("blocked by DDoS-Guard; update cookies and retry")
+		return nil, false, fmt.Errorf("blocked by DDoS-Guard; update cookies and retry")
 	}
 
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
 	if err != nil {
-		return fmt.Errorf("parsing HTML from %s: %v", targetUrl, err)
+		return nil, false, fmt.Errorf("parsing HTML from %s: %v", targetUrl, err)
 	}
 
 	tempTarget := targetUrl
@@ -113,7 +153,7 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 
 	u, err := url.Parse(tempTarget)
 	if err != nil {
-		return fmt.Errorf("parsing URL %s: %v", targetUrl, err)
+		return nil, false, fmt.Errorf("parsing URL %s: %v", targetUrl, err)
 	}
 	u.RawQuery = ""
 	fmt.Printf("Parsed URL path: %s\n", u.Path)
@@ -131,19 +171,32 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 	}
 	fmt.Printf("Creating directory: %s\n", directory)
 	if err := os.MkdirAll(directory, os.ModePerm); err != nil {
-		return fmt.Errorf("creating directory %s: %v", directory, err)
+		return nil, false, fmt.Errorf("creating directory %s: %v", directory, err)
 	}
 	thumbnailDir := directory + "/thumbnails"
 	if err := os.MkdirAll(thumbnailDir, os.ModePerm); err != nil {
-		return fmt.Errorf("creating thumbnail directory %s: %v", thumbnailDir, err)
+		return nil, false, fmt.Errorf("creating thumbnail directory %s: %v", thumbnailDir, err)
 	}
 	fmt.Printf("Directory %s and thumbnail dir %s created or already exist\n", directory, thumbnailDir)
+
+	var newPostIDs []string
+	done := false
 
 	isFirstMatch := true
 	doc.Find(fmt.Sprintf("div[id^='%s']", postId)).Each(func(_ int, s *goquery.Selection) {
 		if !isFirstMatch {
 			fmt.Println("Skipping additional matches for this post ID")
 			return
+		}
+		// Get the actual post ID from the div
+		divID, exists := s.Attr("id")
+		if exists {
+			if processedPosts != nil && processedPosts[divID] {
+				fmt.Printf("Already processed post %s, stopping.\n", divID)
+				done = true
+				return
+			}
+			newPostIDs = append(newPostIDs, divID)
 		}
 		fmt.Printf("Found matching div for %s, parsing images\n", postId)
 		count := s.Find("a img").Length()
@@ -216,7 +269,7 @@ func DownloadGallery(requestURL, targetUrl, title string) error {
 	})
 
 	fmt.Printf("Completed processing for %s\n", targetUrl)
-	return nil
+	return newPostIDs, done, nil
 }
 
 func generateThumbnail(srcPath, destPath string) error {
