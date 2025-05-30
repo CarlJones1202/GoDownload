@@ -80,6 +80,7 @@ func main() {
 	r.GET("/ws", handleWebSocket)
 	r.DELETE("/galleries/:id", deleteGallery)                     // Route for deleting galleries
 	r.POST("/galleries/:id/assign-person", assignPersonToGallery) // Route for assigning person to gallery
+	r.DELETE("/photos/:id", deletePhoto)
 
 	log.Fatal(r.Run(":8081"))
 }
@@ -1173,6 +1174,49 @@ func deleteGallery(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Gallery and all photos deleted"})
+}
+
+func deletePhoto(c *gin.Context) {
+	photoIDStr := c.Param("id")
+	photoID, err := strconv.Atoi(photoIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid photo id"})
+		return
+	}
+
+	// Get file and thumbnail paths
+	var filePath, thumbPath string
+	err = db.QueryRow("SELECT file_path, thumbnail_path FROM photos WHERE id = ?", photoID).Scan(&filePath, &thumbPath)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Photo not found"})
+		return
+	} else if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query photo: " + err.Error()})
+		return
+	}
+
+	// Delete files from disk
+	_ = os.Remove(filePath)
+	_ = os.Remove(thumbPath)
+
+	// Delete from DB (tags, colors, photo)
+	tx, err := db.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction: " + err.Error()})
+		return
+	}
+	defer tx.Rollback()
+
+	_, _ = tx.Exec("DELETE FROM photo_tags WHERE photo_path = ?", filePath)
+	_, _ = tx.Exec("DELETE FROM photo_colors WHERE photo_path = ?", filePath)
+	_, _ = tx.Exec("DELETE FROM photos WHERE id = ?", photoID)
+
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Photo deleted"})
 }
 
 func assignPersonToGallery(c *gin.Context) {
