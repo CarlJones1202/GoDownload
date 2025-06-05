@@ -1,15 +1,18 @@
 package main
 
 import (
+	"awesomeProject/similarity"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"image"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,11 +29,12 @@ import (
 )
 
 var (
-	downloadDir = "./downloads"
-	clients     = make(map[*websocket.Conn]bool)
-	clientsMu   sync.Mutex
-	photoChan   = make(chan string, 100) // For tagging
-	colorChan   = make(chan string, 100) // For color extraction
+	downloadDir     = "./downloads"
+	clients         = make(map[*websocket.Conn]bool)
+	clientsMu       sync.Mutex
+	photoChan       = make(chan string, 100) // For tagging
+	colorChan       = make(chan string, 100) // For color extraction
+	similarityModel *similarity.SimilarityModel
 )
 
 var upgrader = websocket.Upgrader{
@@ -85,7 +89,7 @@ func main() {
 	r.POST("/photos/:id/favorite", favoritePhoto)
 	r.DELETE("/photos/:id/favorite", unfavoritePhoto)
 	r.POST("/photos/:id/similarity-feedback", provideSimilarityFeedback)
-	r.GET("/photos/similar-to-favorites", getSimilarToFavorites)
+	r.GET("/photos/:id/similar", getSimilarPhotos)
 
 	log.Fatal(r.Run(":8081"))
 }
@@ -493,17 +497,6 @@ func listPhotos(c *gin.Context) {
 	perPage, _ := strconv.Atoi(perPageStr)
 	if perPage < 1 {
 		perPage = 50
-	}
-
-	type PhotoWithTagsAndColors struct {
-		Id        int      `json:"id"`
-		RequestID int      `json:"RequestId"`
-		URL       string   `json:"URL"`
-		Path      string   `json:"Path"`
-		Thumbnail string   `json:"Thumbnail"`
-		CreatedAt string   `json:"CreatedAt"`
-		Tags      []string `json:"Tags"`
-		Colors    []string `json:"Colors"`
 	}
 
 	query := `
@@ -1330,6 +1323,7 @@ func provideSimilarityFeedback(c *gin.Context) {
 		return
 	}
 
+	// Store feedback in database
 	_, err = db.Exec(`
         INSERT INTO similarity_feedback (source_photo_id, target_photo_id, is_similar) 
         VALUES (?, ?, ?)
@@ -1342,67 +1336,213 @@ func provideSimilarityFeedback(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Feedback recorded"})
+	// Retrain model with all feedback
+	go func() {
+		if err := retrainModel(); err != nil {
+			log.Printf("Error retraining model: %v", err)
+		}
+	}()
+
+	c.JSON(http.StatusOK, gin.H{"message": "Feedback recorded and model training started"})
 }
 
-func getSimilarToFavorites(c *gin.Context) {
-	// Get photos that are similar to favorited photos based on feedback
-	query := `
-        WITH similar_photos AS (
-            SELECT DISTINCT p.id, p.file_path, p.thumbnail_path, p.created_at,
-                   COUNT(*) as similarity_score
-            FROM photos p
-            JOIN similarity_feedback sf ON p.id = sf.target_photo_id
-            WHERE sf.is_similar = 1
-            AND sf.source_photo_id IN (SELECT photo_id FROM favorites)
-            AND p.id NOT IN (SELECT photo_id FROM favorites)
-            GROUP BY p.id
-            ORDER BY similarity_score DESC
-            LIMIT 20
-        )
-        SELECT sp.*, 
-               GROUP_CONCAT(DISTINCT pe.name) as tags,
-               GROUP_CONCAT(DISTINCT pc.color_hex) as colors
-        FROM similar_photos sp
-        LEFT JOIN photo_tags pt ON sp.file_path = pt.photo_path
-        LEFT JOIN people pe ON pt.person_id = pe.id
-        LEFT JOIN photo_colors pc ON sp.file_path = pc.photo_path
-        GROUP BY sp.id`
+func extractImageFeatures(img image.Image) []float64 {
+	bounds := img.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
 
-	rows, err := db.Query(query)
+	// Simple feature extraction - average color values in a 4x4 grid
+	features := make([]float64, 48) // 4x4x3 (RGB)
+
+	blockWidth := width / 4
+	blockHeight := height / 4
+
+	for i := 0; i < 4; i++ {
+		for j := 0; j < 4; j++ {
+			var r, g, b float64
+			count := 0
+
+			for x := i * blockWidth; x < (i+1)*blockWidth; x++ {
+				for y := j * blockHeight; y < (j+1)*blockHeight; y++ {
+					pr, pg, pb, _ := img.At(x, y).RGBA()
+					r += float64(pr) / 65535.0
+					g += float64(pg) / 65535.0
+					b += float64(pb) / 65535.0
+					count++
+				}
+			}
+
+			idx := (i*4 + j) * 3
+			features[idx] = r / float64(count)
+			features[idx+1] = g / float64(count)
+			features[idx+2] = b / float64(count)
+		}
+	}
+
+	return features
+}
+
+func retrainModel() error {
+	// Get all feedback pairs
+	rows, err := db.Query(`
+        SELECT sf.source_photo_id, sf.target_photo_id, sf.is_similar,
+               s.file_path as source_path, t.file_path as target_path
+        FROM similarity_feedback sf
+        JOIN photos s ON sf.source_photo_id = s.id
+        JOIN photos t ON sf.target_photo_id = t.id
+    `)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query similar photos"})
+		return err
+	}
+	defer rows.Close()
+
+	var features [][]float64
+	var similarities []float64
+
+	for rows.Next() {
+		var sourcePath, targetPath string
+		var isSimilar bool
+		var sourceID, targetID int
+
+		if err := rows.Scan(&sourceID, &targetID, &isSimilar, &sourcePath, &targetPath); err != nil {
+			continue
+		}
+
+		// Extract features from both images
+		sourceImg, err := imaging.Open(sourcePath)
+		if err != nil {
+			continue
+		}
+		targetImg, err := imaging.Open(targetPath)
+		if err != nil {
+			continue
+		}
+
+		sourceFeatures := extractImageFeatures(sourceImg)
+		targetFeatures := extractImageFeatures(targetImg)
+
+		// Calculate feature difference
+		diffFeatures := make([]float64, len(sourceFeatures))
+		for i := range sourceFeatures {
+			diffFeatures[i] = sourceFeatures[i] - targetFeatures[i]
+		}
+
+		features = append(features, diffFeatures)
+		if isSimilar {
+			similarities = append(similarities, 1.0)
+		} else {
+			similarities = append(similarities, 0.0)
+		}
+	}
+
+	if len(features) == 0 {
+		return nil
+	}
+
+	// Train model
+	if similarityModel == nil {
+		similarityModel = similarity.NewSimilarityModel(len(features[0]))
+	}
+
+	return similarityModel.Train(features, similarities)
+}
+
+func getSimilarPhotos(c *gin.Context) {
+	photoID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid photo ID"})
+		return
+	}
+
+	// Get source photo features
+	sourceImg, err := imaging.Open("") // We'll need to get the file path first
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load source image"})
+		return
+	}
+
+	// Get file path for source photo
+	var sourcePath string
+	err = db.QueryRow("SELECT file_path FROM photos WHERE id = ?", photoID).Scan(&sourcePath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to find source photo"})
+		return
+	}
+
+	sourceImg, err = imaging.Open(sourcePath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load source image"})
+		return
+	}
+
+	sourceFeatures := extractImageFeatures(sourceImg)
+
+	// Get all other photos and calculate similarity using the trained model
+	rows, err := db.Query(`
+        SELECT p.id, p.file_path, p.thumbnail_path, p.created_at 
+        FROM photos p 
+        WHERE p.id != ?`, photoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query photos"})
 		return
 	}
 	defer rows.Close()
 
-	var photos []PhotoWithTagsAndColors
+	type photoWithScore struct {
+		PhotoWithTagsAndColors
+		Score float64
+	}
+
+	var results []photoWithScore
 	for rows.Next() {
-		var p PhotoWithTagsAndColors
-		var tags, colors sql.NullString
-		if err := rows.Scan(&p.Id, &p.Path, &p.Thumbnail, &p.CreatedAt, &tags, &colors); err != nil {
+		var p photoWithScore
+		if err := rows.Scan(&p.Id, &p.Path, &p.Thumbnail, &p.CreatedAt); err != nil {
 			continue
 		}
-		if tags.Valid {
-			p.Tags = strings.Split(tags.String, ",")
+
+		targetImg, err := imaging.Open(p.Path)
+		if err != nil {
+			continue
 		}
-		if colors.Valid {
-			p.Colors = strings.Split(colors.String, ",")
+
+		targetFeatures := extractImageFeatures(targetImg)
+		diffFeatures := make([]float64, len(sourceFeatures))
+		for i := range sourceFeatures {
+			diffFeatures[i] = sourceFeatures[i] - targetFeatures[i]
 		}
-		photos = append(photos, p)
+
+		if similarityModel != nil {
+			p.Score = similarityModel.Predict(diffFeatures)
+			results = append(results, p)
+		}
+	}
+
+	// Sort by similarity score
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
+
+	// Take top 20
+	if len(results) > 20 {
+		results = results[:20]
+	}
+
+	// Convert to regular photos for response
+	photos := make([]PhotoWithTagsAndColors, len(results))
+	for i, r := range results {
+		photos[i] = r.PhotoWithTagsAndColors
 	}
 
 	c.JSON(http.StatusOK, photos)
 }
 
 type PhotoWithTagsAndColors struct {
-	Id         int      `json:"id"`
-	RequestID  int      `json:"RequestId"`
-	URL        string   `json:"URL"`
-	Path       string   `json:"Path"`
-	Thumbnail  string   `json:"Thumbnail"`
-	CreatedAt  string   `json:"CreatedAt"`
-	Tags       []string `json:"Tags"`
-	Colors     []string `json:"Colors"`
-	IsFavorite bool     `json:"isFavorite"`
+	Id        int      `json:"id"`
+	RequestID int      `json:"RequestId"`
+	URL       string   `json:"URL"`
+	Path      string   `json:"Path"`
+	Thumbnail string   `json:"Thumbnail"`
+	CreatedAt string   `json:"CreatedAt"`
+	Tags      []string `json:"Tags"`
+	Colors    []string `json:"Colors"`
 }
