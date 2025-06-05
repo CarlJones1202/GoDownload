@@ -90,6 +90,7 @@ func main() {
 	r.DELETE("/photos/:id/favorite", unfavoritePhoto)
 	r.POST("/photos/:id/similarity-feedback", provideSimilarityFeedback)
 	r.GET("/photos/:id/similar", getSimilarPhotos)
+	r.GET("/photos/:id/feedback-candidates", getFeedbackCandidates)
 
 	log.Fatal(r.Run(":8081"))
 }
@@ -1531,6 +1532,66 @@ func getSimilarPhotos(c *gin.Context) {
 	photos := make([]PhotoWithTagsAndColors, len(results))
 	for i, r := range results {
 		photos[i] = r.PhotoWithTagsAndColors
+	}
+
+	c.JSON(http.StatusOK, photos)
+}
+
+func getFeedbackCandidates(c *gin.Context) {
+	photoID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid photo ID"})
+		return
+	}
+
+	// First, find photos that have NOT been labeled for similarity with this photo
+	rows, err := db.Query(`
+        SELECT p.id, p.request_id, p.url, p.file_path, p.thumbnail_path, p.created_at
+        FROM photos p
+        WHERE p.id != ?
+          AND NOT EXISTS (
+            SELECT 1 FROM similarity_feedback sf
+            WHERE sf.source_photo_id = ? AND sf.target_photo_id = p.id
+          )
+        ORDER BY RANDOM()
+        LIMIT 10
+    `, photoID, photoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query unlabeled photos"})
+		return
+	}
+	defer rows.Close()
+
+	var photos []PhotoWithTagsAndColors
+	for rows.Next() {
+		var p PhotoWithTagsAndColors
+		if err := rows.Scan(&p.Id, &p.RequestID, &p.URL, &p.Path, &p.Thumbnail, &p.CreatedAt); err != nil {
+			continue
+		}
+		photos = append(photos, p)
+	}
+
+	// If there are no unlabeled photos, just return random photos
+	if len(photos) == 0 {
+		rows, err := db.Query(`
+            SELECT id, request_id, url, file_path, thumbnail_path, created_at
+            FROM photos
+            WHERE id != ?
+            ORDER BY RANDOM()
+            LIMIT 10
+        `, photoID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query random photos"})
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var p PhotoWithTagsAndColors
+			if err := rows.Scan(&p.Id, &p.RequestID, &p.URL, &p.Path, &p.Thumbnail, &p.CreatedAt); err != nil {
+				continue
+			}
+			photos = append(photos, p)
+		}
 	}
 
 	c.JSON(http.StatusOK, photos)
