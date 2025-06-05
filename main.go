@@ -82,6 +82,11 @@ func main() {
 	r.POST("/galleries/:id/assign-person", assignPersonToGallery) // Route for assigning person to gallery
 	r.DELETE("/photos/:id", deletePhoto)
 
+	r.POST("/photos/:id/favorite", favoritePhoto)
+	r.DELETE("/photos/:id/favorite", unfavoritePhoto)
+	r.POST("/photos/:id/similarity-feedback", provideSimilarityFeedback)
+	r.GET("/photos/similar-to-favorites", getSimilarToFavorites)
+
 	log.Fatal(r.Run(":8081"))
 }
 
@@ -1267,4 +1272,137 @@ func assignPersonToGallery(c *gin.Context) {
 		"message":      "Person assigned to gallery",
 		"photosTagged": count,
 	})
+}
+
+type SimilarityFeedback struct {
+	TargetPhotoID int  `json:"targetPhotoId"`
+	IsSimilar     bool `json:"isSimilar"`
+}
+
+func favoritePhoto(c *gin.Context) {
+	photoID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid photo ID"})
+		return
+	}
+
+	_, err = db.Exec("INSERT OR IGNORE INTO favorites (photo_id) VALUES (?)", photoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to favorite photo"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Photo favorited"})
+}
+
+func unfavoritePhoto(c *gin.Context) {
+	photoID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid photo ID"})
+		return
+	}
+
+	result, err := db.Exec("DELETE FROM favorites WHERE photo_id = ?", photoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unfavorite photo"})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Photo was not favorited"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Photo unfavorited"})
+}
+
+func provideSimilarityFeedback(c *gin.Context) {
+	sourcePhotoID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid source photo ID"})
+		return
+	}
+
+	var feedback SimilarityFeedback
+	if err := c.ShouldBindJSON(&feedback); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	_, err = db.Exec(`
+        INSERT INTO similarity_feedback (source_photo_id, target_photo_id, is_similar) 
+        VALUES (?, ?, ?)
+        ON CONFLICT (source_photo_id, target_photo_id) 
+        DO UPDATE SET is_similar = excluded.is_similar`,
+		sourcePhotoID, feedback.TargetPhotoID, feedback.IsSimilar)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store feedback"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Feedback recorded"})
+}
+
+func getSimilarToFavorites(c *gin.Context) {
+	// Get photos that are similar to favorited photos based on feedback
+	query := `
+        WITH similar_photos AS (
+            SELECT DISTINCT p.id, p.file_path, p.thumbnail_path, p.created_at,
+                   COUNT(*) as similarity_score
+            FROM photos p
+            JOIN similarity_feedback sf ON p.id = sf.target_photo_id
+            WHERE sf.is_similar = 1
+            AND sf.source_photo_id IN (SELECT photo_id FROM favorites)
+            AND p.id NOT IN (SELECT photo_id FROM favorites)
+            GROUP BY p.id
+            ORDER BY similarity_score DESC
+            LIMIT 20
+        )
+        SELECT sp.*, 
+               GROUP_CONCAT(DISTINCT pe.name) as tags,
+               GROUP_CONCAT(DISTINCT pc.color_hex) as colors
+        FROM similar_photos sp
+        LEFT JOIN photo_tags pt ON sp.file_path = pt.photo_path
+        LEFT JOIN people pe ON pt.person_id = pe.id
+        LEFT JOIN photo_colors pc ON sp.file_path = pc.photo_path
+        GROUP BY sp.id`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query similar photos"})
+		return
+	}
+	defer rows.Close()
+
+	var photos []PhotoWithTagsAndColors
+	for rows.Next() {
+		var p PhotoWithTagsAndColors
+		var tags, colors sql.NullString
+		if err := rows.Scan(&p.Id, &p.Path, &p.Thumbnail, &p.CreatedAt, &tags, &colors); err != nil {
+			continue
+		}
+		if tags.Valid {
+			p.Tags = strings.Split(tags.String, ",")
+		}
+		if colors.Valid {
+			p.Colors = strings.Split(colors.String, ",")
+		}
+		photos = append(photos, p)
+	}
+
+	c.JSON(http.StatusOK, photos)
+}
+
+type PhotoWithTagsAndColors struct {
+	Id         int      `json:"id"`
+	RequestID  int      `json:"RequestId"`
+	URL        string   `json:"URL"`
+	Path       string   `json:"Path"`
+	Thumbnail  string   `json:"Thumbnail"`
+	CreatedAt  string   `json:"CreatedAt"`
+	Tags       []string `json:"Tags"`
+	Colors     []string `json:"Colors"`
+	IsFavorite bool     `json:"isFavorite"`
 }

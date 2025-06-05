@@ -44,6 +44,21 @@ func initDB() *sql.DB {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (request_id) REFERENCES requests(id)
         );
+		CREATE TABLE IF NOT EXISTS favorites (
+			photo_id INTEGER PRIMARY KEY,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE
+		);
+
+		CREATE TABLE IF NOT EXISTS similarity_feedback (
+			source_photo_id INTEGER,
+			target_photo_id INTEGER,
+			is_similar BOOLEAN NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (source_photo_id, target_photo_id),
+			FOREIGN KEY (source_photo_id) REFERENCES photos(id) ON DELETE CASCADE,
+			FOREIGN KEY (target_photo_id) REFERENCES photos(id) ON DELETE CASCADE
+		);
         CREATE TABLE IF NOT EXISTS photo_colors (
             photo_path TEXT,
             color_hex TEXT,
