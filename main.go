@@ -91,6 +91,7 @@ func main() {
 	r.POST("/photos/:id/similarity-feedback", provideSimilarityFeedback)
 	r.GET("/photos/:id/similar", getSimilarPhotos)
 	r.GET("/photos/:id/feedback-candidates", getFeedbackCandidates)
+	r.GET("/requests/pending", listPendingRequests) // New route for pending requests
 
 	log.Fatal(r.Run(":8081"))
 }
@@ -1595,6 +1596,39 @@ func getFeedbackCandidates(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, photos)
+}
+
+func listPendingRequests(c *gin.Context) {
+	// Order: processing first, then pending, both by oldest created_at
+	rows, err := db.Query(`
+		SELECT id, url, created_at, status FROM requests 
+		WHERE status IN ('pending', 'processing') 
+		ORDER BY 
+			CASE status WHEN 'processing' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+			created_at ASC
+	`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	type PendingRequest struct {
+		ID        int    `json:"id"`
+		URL       string `json:"url"`
+		CreatedAt string `json:"createdAt"`
+		Status    string `json:"status"`
+	}
+
+	var requests []PendingRequest
+	for rows.Next() {
+		var r PendingRequest
+		if err := rows.Scan(&r.ID, &r.URL, &r.CreatedAt, &r.Status); err != nil {
+			continue
+		}
+		requests = append(requests, r)
+	}
+	c.JSON(http.StatusOK, requests)
 }
 
 type PhotoWithTagsAndColors struct {
