@@ -199,57 +199,70 @@ func updatePerson(c *gin.Context) {
 }
 
 func processPendingDownloads() {
+	jobs := make(chan struct {
+		id  int
+		url string
+	}, 100)
+
+	// Start workers
+	for i := 0; i < 4; i++ {
+		go func() {
+			for job := range jobs {
+				// Mark as processing
+				_, err := db.Exec("UPDATE requests SET status = 'processing' WHERE id = ?", job.id)
+				if err != nil {
+					log.Printf("Error marking request %d as processing: %v", job.id, err)
+					continue
+				}
+
+				// Process the URL
+				log.Printf("Processing request %d: %s", job.id, job.url)
+				err = processURL(job.url)
+				if err != nil {
+					log.Printf("Failed to process URL %s: %v", job.url, err)
+					_, err = db.Exec("UPDATE requests SET status = 'failed' WHERE id = ?", job.id)
+					if err != nil {
+						log.Printf("Error marking request %d as failed: %v", job.id, err)
+					}
+				} else {
+					_, err = db.Exec("UPDATE requests SET status = 'completed' WHERE id = ?", job.id)
+					if err != nil {
+						log.Printf("Error marking request %d as completed: %v", job.id, err)
+					}
+					log.Printf("Completed processing request %d: %s", job.id, job.url)
+				}
+			}
+		}()
+	}
+
+	// Producer: fetch jobs and send to workers
 	for {
-		rows, err := db.Query("SELECT id, url FROM requests WHERE status = 'pending' LIMIT 1")
+		rows, err := db.Query("SELECT id, url FROM requests WHERE status = 'pending' LIMIT 10")
 		if err != nil {
 			log.Printf("Error querying pending requests: %v", err)
 			time.Sleep(10 * time.Second)
 			continue
 		}
 
-		var id int
-		var url string
-		hasNext := rows.Next()
-		if !hasNext {
-			rows.Close()
-			time.Sleep(10 * time.Second)
-			continue
+		var jobsFound int
+		for rows.Next() {
+			var id int
+			var url string
+			if err := rows.Scan(&id, &url); err == nil {
+				jobs <- struct {
+					id  int
+					url string
+				}{id, url}
+				jobsFound++
+			}
 		}
-
-		err = rows.Scan(&id, &url)
 		rows.Close()
-		if err != nil {
-			log.Printf("Error scanning pending request: %v", err)
+
+		if jobsFound == 0 {
 			time.Sleep(10 * time.Second)
-			continue
-		}
-
-		// Mark as processing
-		_, err = db.Exec("UPDATE requests SET status = 'processing' WHERE id = ?", id)
-		if err != nil {
-			log.Printf("Error marking request %d as processing: %v", id, err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		// Process the URL
-		log.Printf("Processing request %d: %s", id, url)
-		err = processURL(url)
-		if err != nil {
-			log.Printf("Failed to process URL %s: %v", url, err)
-			_, err = db.Exec("UPDATE requests SET status = 'failed' WHERE id = ?", id)
-			if err != nil {
-				log.Printf("Error marking request %d as failed: %v", id, err)
-			}
 		} else {
-			_, err = db.Exec("UPDATE requests SET status = 'completed' WHERE id = ?", id)
-			if err != nil {
-				log.Printf("Error marking request %d as completed: %v", id, err)
-			}
-			log.Printf("Completed processing request %d: %s", id, url)
+			time.Sleep(2 * time.Second)
 		}
-
-		time.Sleep(2 * time.Second) // Small delay between processing
 	}
 }
 
