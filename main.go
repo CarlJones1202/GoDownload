@@ -92,6 +92,7 @@ func main() {
 	r.GET("/photos/:id/similar", getSimilarPhotos)
 	r.GET("/photos/:id/feedback-candidates", getFeedbackCandidates)
 	r.GET("/requests/pending", listPendingRequests) // New route for pending requests
+	r.GET("/photos/favorites", listFavoritePhotos)  // Route for favorite photos
 
 	log.Fatal(r.Run(":8081"))
 }
@@ -613,6 +614,36 @@ func listPhotos(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+
+	// After getting the photos array, before returning response:
+	if len(photos) > 0 {
+		// Build list of photo IDs
+		photoIDs := make([]string, len(photos))
+		photoIDMap := make(map[int]int) // map[photoID]arrayIndex
+		for i, p := range photos {
+			photoIDs[i] = strconv.Itoa(p.Id)
+			photoIDMap[p.Id] = i
+		}
+
+		// Query favorites
+		favQuery := `
+            SELECT photo_id 
+            FROM favorites 
+            WHERE photo_id IN (` + strings.Join(photoIDs, ",") + `)`
+
+		favRows, err := db.Query(favQuery)
+		if err == nil {
+			defer favRows.Close()
+			for favRows.Next() {
+				var photoID int
+				if err := favRows.Scan(&photoID); err == nil {
+					if idx, exists := photoIDMap[photoID]; exists {
+						photos[idx].Favorited = true
+					}
+				}
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1644,6 +1675,79 @@ func listPendingRequests(c *gin.Context) {
 	c.JSON(http.StatusOK, requests)
 }
 
+func listFavoritePhotos(c *gin.Context) {
+	pageStr := c.DefaultQuery("page", "1")
+	perPageStr := c.DefaultQuery("per_page", "50")
+
+	page, _ := strconv.Atoi(pageStr)
+	if page < 1 {
+		page = 1
+	}
+	perPage, _ := strconv.Atoi(perPageStr)
+	if perPage < 1 {
+		perPage = 50
+	}
+
+	query := `
+        SELECT p.id, p.request_id, p.url, p.file_path, p.thumbnail_path, p.created_at,
+               GROUP_CONCAT(DISTINCT pe.name) as tags,
+               GROUP_CONCAT(DISTINCT pc.color_hex) as colors
+        FROM photos p
+        JOIN favorites f ON p.id = f.photo_id
+        LEFT JOIN photo_tags pt ON p.file_path = pt.photo_path
+        LEFT JOIN people pe ON pt.person_id = pe.id
+        LEFT JOIN photo_colors pc ON p.file_path = pc.photo_path
+        GROUP BY p.id
+        ORDER BY f.created_at DESC
+        LIMIT ? OFFSET ?
+    `
+
+	rows, err := db.Query(query, perPage, (page-1)*perPage)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var photos []PhotoWithTagsAndColors
+	for rows.Next() {
+		var p PhotoWithTagsAndColors
+		var tags, colors sql.NullString
+		err := rows.Scan(&p.Id, &p.RequestID, &p.URL, &p.Path, &p.Thumbnail,
+			&p.CreatedAt, &tags, &colors)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		if tags.Valid {
+			p.Tags = strings.Split(tags.String, ",")
+		}
+		if colors.Valid {
+			p.Colors = strings.Split(colors.String, ",")
+		}
+		p.Favorited = true // Always true for favorites list
+
+		photos = append(photos, p)
+	}
+
+	// Get total count
+	var total int
+	err = db.QueryRow("SELECT COUNT(*) FROM favorites").Scan(&total)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"photos":      photos,
+		"total":       total,
+		"page":        page,
+		"per_page":    perPage,
+		"total_pages": (total + perPage - 1) / perPage,
+	})
+}
+
 type PhotoWithTagsAndColors struct {
 	Id        int      `json:"id"`
 	RequestID int      `json:"RequestId"`
@@ -1653,4 +1757,5 @@ type PhotoWithTagsAndColors struct {
 	CreatedAt string   `json:"CreatedAt"`
 	Tags      []string `json:"Tags"`
 	Colors    []string `json:"Colors"`
+	Favorited bool     `json:"favorited"`
 }
