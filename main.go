@@ -1032,28 +1032,53 @@ func broadcastNewPhoto() {
 const maxConcurrentDownloads = 5
 
 func checkAndRedownloadMissingFiles() error {
-	// Fetch all rows into memory to release the database connection quickly
+	// Helper struct
 	type photo struct {
 		url      string
 		filePath string
 	}
+
 	var photos []photo
 
-	rows, err := db.Query("SELECT url, file_path FROM photos ORDER BY created_at DESC")
+	// 1. Query favorited photos first
+	favRows, err := db.Query(`
+        SELECT p.url, p.file_path
+        FROM photos p
+        JOIN favorites f ON p.id = f.photo_id
+        ORDER BY f.created_at DESC
+    `)
 	if err != nil {
-		return fmt.Errorf("querying photos: %v", err)
+		return fmt.Errorf("querying favorited photos: %v", err)
 	}
-	defer rows.Close()
-
-	for rows.Next() {
+	defer favRows.Close()
+	for favRows.Next() {
 		var url, filePath string
-		if err := rows.Scan(&url, &filePath); err != nil {
-			return fmt.Errorf("scanning photo: %v", err)
+		if err := favRows.Scan(&url, &filePath); err == nil {
+			photos = append(photos, photo{url: url, filePath: filePath})
 		}
-		photos = append(photos, photo{url: url, filePath: filePath})
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("reading rows: %v", err)
+
+	// 2. Query all other photos (excluding those already in the list)
+	allRows, err := db.Query(`
+        SELECT url, file_path
+        FROM photos
+        ORDER BY created_at DESC
+    `)
+	if err != nil {
+		return fmt.Errorf("querying all photos: %v", err)
+	}
+	defer allRows.Close()
+	seen := make(map[string]bool)
+	for _, p := range photos {
+		seen[p.filePath] = true
+	}
+	for allRows.Next() {
+		var url, filePath string
+		if err := allRows.Scan(&url, &filePath); err == nil {
+			if !seen[filePath] {
+				photos = append(photos, photo{url: url, filePath: filePath})
+			}
+		}
 	}
 
 	// Filter missing files
@@ -1077,11 +1102,10 @@ func checkAndRedownloadMissingFiles() error {
 	// Process tasks concurrently
 	for _, task := range tasks {
 		wg.Add(1)
-		sem <- struct{}{} // Acquire semaphore slot
+		sem <- struct{}{}
 		go func(url, filePath string) {
 			defer wg.Done()
-			defer func() { <-sem }() // Release semaphore slot
-
+			defer func() { <-sem }()
 			log.Printf("File missing: %s, redownloading from %s", filePath, url)
 			if err := DownloadFile(url, filePath); err != nil {
 				log.Printf("Failed to redownload %s: %v", url, err)
@@ -1090,7 +1114,6 @@ func checkAndRedownloadMissingFiles() error {
 				mu.Unlock()
 				return
 			}
-
 			log.Printf("Redownloaded %s to %s", url, filePath)
 			filename := path.Base(filePath)
 			directory := filepath.Dir(filePath)
@@ -1102,7 +1125,6 @@ func checkAndRedownloadMissingFiles() error {
 				mu.Unlock()
 				return
 			}
-
 			thumbnailPath := fmt.Sprintf("%s/thumb_%s", thumbnailDir, filename)
 			if err := generateThumbnail(filePath, thumbnailPath); err != nil {
 				log.Printf("Error generating thumbnail for %s: %v", filePath, err)
@@ -1115,10 +1137,8 @@ func checkAndRedownloadMissingFiles() error {
 		}(task.url, task.filePath)
 	}
 
-	// Wait for all downloads to complete
 	wg.Wait()
 
-	// Report aggregated errors
 	if len(errors) > 0 {
 		errMsg := "Errors during redownload:\n"
 		for _, err := range errors {
