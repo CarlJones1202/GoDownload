@@ -1729,19 +1729,30 @@ func deletePendingRequest(c *gin.Context) {
 }
 
 func listFavoritePhotos(c *gin.Context) {
-	pageStr := c.DefaultQuery("page", "1")
-	perPageStr := c.DefaultQuery("per_page", "50")
+    pageStr := c.DefaultQuery("page", "1")
+    perPageStr := c.DefaultQuery("per_page", "50")
+    seedStr := c.DefaultQuery("seed", "")
 
-	page, _ := strconv.Atoi(pageStr)
-	if page < 1 {
-		page = 1
-	}
-	perPage, _ := strconv.Atoi(perPageStr)
-	if perPage < 1 {
-		perPage = 50
-	}
+    page, _ := strconv.Atoi(pageStr)
+    if page < 1 {
+        page = 1
+    }
+    perPage, _ := strconv.Atoi(perPageStr)
+    if perPage < 1 {
+        perPage = 50
+    }
 
-	query := `
+    // If seed is provided, set the SQLite random seed
+    if seedStr != "" {
+        seed, err := strconv.ParseInt(seedStr, 10, 64)
+        if err == nil {
+            // This works for SQLite, but not all drivers support PRAGMA for random seed.
+            // If using modernc.org/sqlite, this is supported.
+            _, _ = db.Exec(fmt.Sprintf("PRAGMA random_seed = %d", seed))
+        }
+    }
+
+    query := `
         SELECT p.id, p.request_id, p.url, p.file_path, p.thumbnail_path, p.created_at,
                GROUP_CONCAT(DISTINCT pe.name) as tags,
                GROUP_CONCAT(DISTINCT pc.color_hex) as colors
@@ -1751,54 +1762,59 @@ func listFavoritePhotos(c *gin.Context) {
         LEFT JOIN people pe ON pt.person_id = pe.id
         LEFT JOIN photo_colors pc ON p.file_path = pc.photo_path
         GROUP BY p.id
-        ORDER BY f.created_at DESC
-        LIMIT ? OFFSET ?
     `
+    // Use ORDER BY RANDOM() if seed is provided, else order by favorited time
+    if seedStr != "" {
+        query += " ORDER BY RANDOM()"
+    } else {
+        query += " ORDER BY f.created_at DESC"
+    }
+    query += " LIMIT ? OFFSET ?"
 
-	rows, err := db.Query(query, perPage, (page-1)*perPage)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	defer rows.Close()
+    rows, err := db.Query(query, perPage, (page-1)*perPage)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    defer rows.Close()
 
-	var photos []PhotoWithTagsAndColors
-	for rows.Next() {
-		var p PhotoWithTagsAndColors
-		var tags, colors sql.NullString
-		err := rows.Scan(&p.Id, &p.RequestID, &p.URL, &p.Path, &p.Thumbnail,
-			&p.CreatedAt, &tags, &colors)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
+    var photos []PhotoWithTagsAndColors
+    for rows.Next() {
+        var p PhotoWithTagsAndColors
+        var tags, colors sql.NullString
+        err := rows.Scan(&p.Id, &p.RequestID, &p.URL, &p.Path, &p.Thumbnail,
+            &p.CreatedAt, &tags, &colors)
+        if err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+            return
+        }
 
-		if tags.Valid {
-			p.Tags = strings.Split(tags.String, ",")
-		}
-		if colors.Valid {
-			p.Colors = strings.Split(colors.String, ",")
-		}
-		p.Favorited = true // Always true for favorites list
+        if tags.Valid {
+            p.Tags = strings.Split(tags.String, ",")
+        }
+        if colors.Valid {
+            p.Colors = strings.Split(colors.String, ",")
+        }
+        p.Favorited = true // Always true for favorites list
 
-		photos = append(photos, p)
-	}
+        photos = append(photos, p)
+    }
 
-	// Get total count
-	var total int
-	err = db.QueryRow("SELECT COUNT(*) FROM favorites").Scan(&total)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+    // Get total count
+    var total int
+    err = db.QueryRow("SELECT COUNT(*) FROM favorites").Scan(&total)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
 
-	c.JSON(http.StatusOK, gin.H{
-		"photos":      photos,
-		"total":       total,
-		"page":        page,
-		"per_page":    perPage,
-		"total_pages": (total + perPage - 1) / perPage,
-	})
+    c.JSON(http.StatusOK, gin.H{
+        "photos":      photos,
+        "total":       total,
+        "page":        page,
+        "per_page":    perPage,
+        "total_pages": (total + perPage - 1) / perPage,
+    })
 }
 
 type PhotoWithTagsAndColors struct {
