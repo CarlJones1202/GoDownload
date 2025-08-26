@@ -93,6 +93,7 @@ func main() {
 	r.GET("/photos/:id/feedback-candidates", getFeedbackCandidates)
 	r.GET("/requests/pending", listPendingRequests) // New route for pending requests
 	r.GET("/photos/favorites", listFavoritePhotos)  // Route for favorite photos
+	r.DELETE("/requests/:id", deletePendingRequest)
 
 	log.Fatal(r.Run(":8081"))
 }
@@ -1693,6 +1694,38 @@ func listPendingRequests(c *gin.Context) {
 		requests = append(requests, r)
 	}
 	c.JSON(http.StatusOK, requests)
+}
+
+func deletePendingRequest(c *gin.Context) {
+    idStr := c.Param("id")
+    id, err := strconv.Atoi(idStr)
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request ID"})
+        return
+    }
+
+    var status string
+    err = db.QueryRow("SELECT status FROM requests WHERE id = ?", id).Scan(&status)
+    if err == sql.ErrNoRows {
+        c.JSON(http.StatusNotFound, gin.H{"error": "Request not found"})
+        return
+    } else if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query request"})
+        return
+    }
+
+    if status != "pending" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Unable to remove a request that has been started"})
+        return
+    }
+
+    _, err = db.Exec("DELETE FROM requests WHERE id = ?", id)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete request"})
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{"message": "Request deleted"})
 }
 
 func listFavoritePhotos(c *gin.Context) {
