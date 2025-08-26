@@ -8,6 +8,7 @@ import (
 	"image"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"path"
@@ -1742,16 +1743,6 @@ func listFavoritePhotos(c *gin.Context) {
         perPage = 50
     }
 
-    // If seed is provided, set the SQLite random seed
-    if seedStr != "" {
-        seed, err := strconv.ParseInt(seedStr, 10, 64)
-        if err == nil {
-            // This works for SQLite, but not all drivers support PRAGMA for random seed.
-            // If using modernc.org/sqlite, this is supported.
-            _, _ = db.Exec(fmt.Sprintf("PRAGMA random_seed = %d", seed))
-        }
-    }
-
     query := `
         SELECT p.id, p.request_id, p.url, p.file_path, p.thumbnail_path, p.created_at,
                GROUP_CONCAT(DISTINCT pe.name) as tags,
@@ -1762,16 +1753,10 @@ func listFavoritePhotos(c *gin.Context) {
         LEFT JOIN people pe ON pt.person_id = pe.id
         LEFT JOIN photo_colors pc ON p.file_path = pc.photo_path
         GROUP BY p.id
+        ORDER BY f.created_at DESC
     `
-    // Use ORDER BY RANDOM() if seed is provided, else order by favorited time
-    if seedStr != "" {
-        query += " ORDER BY RANDOM()"
-    } else {
-        query += " ORDER BY f.created_at DESC"
-    }
-    query += " LIMIT ? OFFSET ?"
 
-    rows, err := db.Query(query, perPage, (page-1)*perPage)
+    rows, err := db.Query(query)
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
@@ -1800,6 +1785,28 @@ func listFavoritePhotos(c *gin.Context) {
         photos = append(photos, p)
     }
 
+    // Shuffle deterministically if seed is provided
+    if seedStr != "" {
+        seed, err := strconv.ParseInt(seedStr, 10, 64)
+        if err == nil {
+            rnd := rand.New(rand.NewSource(seed))
+            rnd.Shuffle(len(photos), func(i, j int) {
+                photos[i], photos[j] = photos[j], photos[i]
+            })
+        }
+    }
+
+    // Paginate after shuffling
+    start := (page - 1) * perPage
+    end := start + perPage
+    if start > len(photos) {
+        start = len(photos)
+    }
+    if end > len(photos) {
+        end = len(photos)
+    }
+    pagedPhotos := photos[start:end]
+
     // Get total count
     var total int
     err = db.QueryRow("SELECT COUNT(*) FROM favorites").Scan(&total)
@@ -1809,7 +1816,7 @@ func listFavoritePhotos(c *gin.Context) {
     }
 
     c.JSON(http.StatusOK, gin.H{
-        "photos":      photos,
+        "photos":      pagedPhotos,
         "total":       total,
         "page":        page,
         "per_page":    perPage,
