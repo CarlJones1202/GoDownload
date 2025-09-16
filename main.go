@@ -59,14 +59,6 @@ func main() {
 
 	go func() {
 		for {
-			if err := checkForMissingGalleries(); err != nil {
-				log.Printf("Gallery check failed: %v", err)
-			}
-		}
-	}()
-
-	go func() {
-		for {
 			if err := checkAndRedownloadMissingFiles(); err != nil {
 				log.Printf("Redownload check failed: %v", err)
 			}
@@ -1045,17 +1037,6 @@ func broadcastNewPhoto() {
 			delete(clients, conn)
 		}
 	}
-}
-
-func checkForMissingGalleries() error {
-	_, err := db.Exec(`
-		INSERT INTO galleries (name, request_id)
-        SELECT 'Unknown', r.id
-        FROM requests r
-        LEFT JOIN galleries g ON r.id = g.request_id
-		WHERE g.id IS NULL
-    `)
-	return err
 }
 
 const maxConcurrentDownloads = 5
