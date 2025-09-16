@@ -59,6 +59,14 @@ func main() {
 
 	go func() {
 		for {
+			if err := checkForMissingGalleries(); err != nil {
+				log.Printf("Gallery check failed: %v", err)
+			}
+		}
+	}()
+
+	go func() {
+		for {
 			if err := checkAndRedownloadMissingFiles(); err != nil {
 				log.Printf("Redownload check failed: %v", err)
 			}
@@ -874,6 +882,7 @@ func setProfilePhoto(c *gin.Context) {
 
 type GalleryWithPeople struct {
 	ID        int      `json:"id"`
+	Name      string   `json:"name"`
 	URL       string   `json:"url"`
 	CreatedAt string   `json:"createdAt"`
 	Thumbnail string   `json:"thumbnail,omitempty"`
@@ -886,8 +895,9 @@ func listGalleries(c *gin.Context) {
 	var galleries []GalleryWithPeople
 
 	query := `
-        SELECT DISTINCT r.id, r.url, r.created_at, MIN(p.thumbnail_path) as thumbnail
-        FROM requests r
+        SELECT DISTINCT g.id, g.name, r.created_at, MIN(p.thumbnail_path) as thumbnail
+        FROM galleries g
+		JOIN requests r ON g.request_id = r.id
         JOIN photos p ON r.id = p.request_id
     `
 	var args []interface{}
@@ -1029,6 +1039,17 @@ func broadcastNewPhoto() {
 			delete(clients, conn)
 		}
 	}
+}
+
+func checkForMissingGalleries() error {
+	_, err := db.Exec(`
+		INSERT INTO galleries (name, request_id)
+        SELECT 'Unknown', r.id
+        FROM requests r
+        LEFT JOIN galleries g ON r.id = g.request_id
+		WHERE g.id IS NULL
+    `)
+	return err
 }
 
 const maxConcurrentDownloads = 5
@@ -1698,52 +1719,52 @@ func listPendingRequests(c *gin.Context) {
 }
 
 func deletePendingRequest(c *gin.Context) {
-    idStr := c.Param("id")
-    id, err := strconv.Atoi(idStr)
-    if err != nil {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request ID"})
-        return
-    }
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request ID"})
+		return
+	}
 
-    var status string
-    err = db.QueryRow("SELECT status FROM requests WHERE id = ?", id).Scan(&status)
-    if err == sql.ErrNoRows {
-        c.JSON(http.StatusNotFound, gin.H{"error": "Request not found"})
-        return
-    } else if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query request"})
-        return
-    }
+	var status string
+	err = db.QueryRow("SELECT status FROM requests WHERE id = ?", id).Scan(&status)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Request not found"})
+		return
+	} else if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query request"})
+		return
+	}
 
-    if status != "pending" {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Unable to remove a request that has been started"})
-        return
-    }
+	if status != "pending" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Unable to remove a request that has been started"})
+		return
+	}
 
-    _, err = db.Exec("DELETE FROM requests WHERE id = ?", id)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete request"})
-        return
-    }
+	_, err = db.Exec("DELETE FROM requests WHERE id = ?", id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete request"})
+		return
+	}
 
-    c.JSON(http.StatusOK, gin.H{"message": "Request deleted"})
+	c.JSON(http.StatusOK, gin.H{"message": "Request deleted"})
 }
 
 func listFavoritePhotos(c *gin.Context) {
-    pageStr := c.DefaultQuery("page", "1")
-    perPageStr := c.DefaultQuery("per_page", "50")
-    seedStr := c.DefaultQuery("seed", "")
+	pageStr := c.DefaultQuery("page", "1")
+	perPageStr := c.DefaultQuery("per_page", "50")
+	seedStr := c.DefaultQuery("seed", "")
 
-    page, _ := strconv.Atoi(pageStr)
-    if page < 1 {
-        page = 1
-    }
-    perPage, _ := strconv.Atoi(perPageStr)
-    if perPage < 1 {
-        perPage = 50
-    }
+	page, _ := strconv.Atoi(pageStr)
+	if page < 1 {
+		page = 1
+	}
+	perPage, _ := strconv.Atoi(perPageStr)
+	if perPage < 1 {
+		perPage = 50
+	}
 
-    query := `
+	query := `
         SELECT p.id, p.request_id, p.url, p.file_path, p.thumbnail_path, p.created_at,
                GROUP_CONCAT(DISTINCT pe.name) as tags,
                GROUP_CONCAT(DISTINCT pc.color_hex) as colors
@@ -1756,72 +1777,72 @@ func listFavoritePhotos(c *gin.Context) {
         ORDER BY f.created_at DESC
     `
 
-    rows, err := db.Query(query)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer rows.Close()
+	rows, err := db.Query(query)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
 
-    var photos []PhotoWithTagsAndColors
-    for rows.Next() {
-        var p PhotoWithTagsAndColors
-        var tags, colors sql.NullString
-        err := rows.Scan(&p.Id, &p.RequestID, &p.URL, &p.Path, &p.Thumbnail,
-            &p.CreatedAt, &tags, &colors)
-        if err != nil {
-            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-            return
-        }
+	var photos []PhotoWithTagsAndColors
+	for rows.Next() {
+		var p PhotoWithTagsAndColors
+		var tags, colors sql.NullString
+		err := rows.Scan(&p.Id, &p.RequestID, &p.URL, &p.Path, &p.Thumbnail,
+			&p.CreatedAt, &tags, &colors)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 
-        if tags.Valid {
-            p.Tags = strings.Split(tags.String, ",")
-        }
-        if colors.Valid {
-            p.Colors = strings.Split(colors.String, ",")
-        }
-        p.Favorited = true // Always true for favorites list
+		if tags.Valid {
+			p.Tags = strings.Split(tags.String, ",")
+		}
+		if colors.Valid {
+			p.Colors = strings.Split(colors.String, ",")
+		}
+		p.Favorited = true // Always true for favorites list
 
-        photos = append(photos, p)
-    }
+		photos = append(photos, p)
+	}
 
-    // Shuffle deterministically if seed is provided
-    if seedStr != "" {
-        seed, err := strconv.ParseInt(seedStr, 10, 64)
-        if err == nil {
-            rnd := rand.New(rand.NewSource(seed))
-            rnd.Shuffle(len(photos), func(i, j int) {
-                photos[i], photos[j] = photos[j], photos[i]
-            })
-        }
-    }
+	// Shuffle deterministically if seed is provided
+	if seedStr != "" {
+		seed, err := strconv.ParseInt(seedStr, 10, 64)
+		if err == nil {
+			rnd := rand.New(rand.NewSource(seed))
+			rnd.Shuffle(len(photos), func(i, j int) {
+				photos[i], photos[j] = photos[j], photos[i]
+			})
+		}
+	}
 
-    // Paginate after shuffling
-    start := (page - 1) * perPage
-    end := start + perPage
-    if start > len(photos) {
-        start = len(photos)
-    }
-    if end > len(photos) {
-        end = len(photos)
-    }
-    pagedPhotos := photos[start:end]
+	// Paginate after shuffling
+	start := (page - 1) * perPage
+	end := start + perPage
+	if start > len(photos) {
+		start = len(photos)
+	}
+	if end > len(photos) {
+		end = len(photos)
+	}
+	pagedPhotos := photos[start:end]
 
-    // Get total count
-    var total int
-    err = db.QueryRow("SELECT COUNT(*) FROM favorites").Scan(&total)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
+	// Get total count
+	var total int
+	err = db.QueryRow("SELECT COUNT(*) FROM favorites").Scan(&total)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
-    c.JSON(http.StatusOK, gin.H{
-        "photos":      pagedPhotos,
-        "total":       total,
-        "page":        page,
-        "per_page":    perPage,
-        "total_pages": (total + perPage - 1) / perPage,
-    })
+	c.JSON(http.StatusOK, gin.H{
+		"photos":      pagedPhotos,
+		"total":       total,
+		"page":        page,
+		"per_page":    perPage,
+		"total_pages": (total + perPage - 1) / perPage,
+	})
 }
 
 type PhotoWithTagsAndColors struct {

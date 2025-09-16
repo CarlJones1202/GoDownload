@@ -35,6 +35,18 @@ func initDB() *sql.DB {
             url TEXT UNIQUE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+		CREATE TABLE IF NOT EXISTS studios (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT UNIQUE
+		);
+		CREATE TABLE IF NOT EXISTS galleries (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER,
+            studio_id INTEGER,
+			name TEXT,
+            FOREIGN KEY (request_id) REFERENCES requests(id),
+            FOREIGN KEY (studio_id) REFERENCES studios(id)
+		);
         CREATE TABLE IF NOT EXISTS photos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_id INTEGER,
