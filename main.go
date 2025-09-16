@@ -532,7 +532,9 @@ func listPhotos(c *gin.Context) {
         FROM photos p 
         LEFT JOIN photo_tags pt ON p.file_path = pt.photo_path 
         LEFT JOIN people pe ON pt.person_id = pe.id 
-        LEFT JOIN photo_colors pc ON p.file_path = pc.photo_path
+		LEFT JOIN photo_colors pc ON p.file_path = pc.photo_path 
+		LEFT JOIN requests r ON p.request_id = r.id
+		LEFT JOIN galleries g ON r.id = g.request_id 
     `
 	countQuery := "SELECT COUNT(DISTINCT p.file_path) FROM photos p"
 	whereClauses := []string{}
@@ -553,8 +555,11 @@ func listPhotos(c *gin.Context) {
 	if galleryIDStr != "" {
 		galleryID, err := strconv.Atoi(galleryIDStr)
 		if err == nil {
-			whereClauses = append(whereClauses, "p.request_id = ?")
+			whereClauses = append(whereClauses, "g.id = ?")
 			args = append(args, galleryID)
+			// Ensure countQuery also joins through requests -> galleries when filtering by gallery
+			countQuery += " LEFT JOIN requests r ON p.request_id = r.id"
+			countQuery += " LEFT JOIN galleries g ON r.id = g.request_id"
 		}
 	}
 
