@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -25,6 +27,8 @@ func initDB() *sql.DB {
 	}
 
 	db.Exec("PRAGMA journal_mode=WAL;")
+	// Recommend synchronous normal for better performance with WAL
+	db.Exec("PRAGMA synchronous=NORMAL;")
 
 	if err != nil {
 		log.Fatal(err)
@@ -131,4 +135,24 @@ func storePhoto(requestURL, photoURL, filePath, thumbnailPath string) error {
 
 	broadcastNewPhoto()
 	return nil
+}
+
+// execWithRetry executes a query with retries on SQLITE_BUSY
+func execWithRetry(query string, args ...interface{}) (sql.Result, error) {
+	var (
+		res sql.Result
+		err error
+	)
+	for i := 0; i < 5; i++ {
+		res, err = db.Exec(query, args...)
+		if err == nil {
+			return res, nil
+		}
+		if strings.Contains(err.Error(), "database is locked") || strings.Contains(err.Error(), "SQLITE_BUSY") {
+			time.Sleep(time.Duration(100*(i+1)) * time.Millisecond)
+			continue
+		}
+		return nil, err
+	}
+	return res, err
 }

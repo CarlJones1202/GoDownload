@@ -1321,7 +1321,7 @@ func updateGallery(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing or invalid name"})
 		return
 	}
-	_, err = db.Exec("UPDATE galleries SET name = ? WHERE id = ?", req.Name, galleryID)
+	_, err = execWithRetry("UPDATE galleries SET name = ? WHERE id = ?", req.Name, galleryID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update gallery: " + err.Error()})
 		return
@@ -1347,29 +1347,33 @@ func assignPersonToGallery(c *gin.Context) {
 		return
 	}
 
-	// Get all photo file paths for this gallery
+	// Get all photo file paths for this gallery (collect first, then insert)
 	rows, err := db.Query("SELECT file_path FROM photos WHERE request_id = ?", galleryID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query photos: " + err.Error()})
 		return
 	}
-	defer rows.Close()
+	var filePaths []string
+	for rows.Next() {
+		var fp string
+		if err := rows.Scan(&fp); err == nil {
+			filePaths = append(filePaths, fp)
+		}
+	}
+	rows.Close()
 
-	log.Printf("Assigning person %d to gallery %d", req.PersonID, galleryID)
+	Infof("Assigning person %d to gallery %d", req.PersonID, galleryID)
 
 	count := 0
-	for rows.Next() {
-		var filePath string
-		if err := rows.Scan(&filePath); err == nil {
-			_, err := db.Exec(
-				"INSERT OR IGNORE INTO photo_tags (photo_path, person_id) VALUES (?, ?)",
-				filePath, req.PersonID,
-			)
-			if err == nil {
-				count++
-			} else {
-				log.Printf("Failed to tag photo %s: %v", filePath, err)
-			}
+	for _, filePath := range filePaths {
+		_, err := execWithRetry(
+			"INSERT OR IGNORE INTO photo_tags (photo_path, person_id) VALUES (?, ?)",
+			filePath, req.PersonID,
+		)
+		if err == nil {
+			count++
+		} else {
+			Warnf("Failed to tag photo %s: %v", filePath, err)
 		}
 	}
 
