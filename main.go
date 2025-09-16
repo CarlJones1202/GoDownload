@@ -91,7 +91,8 @@ func main() {
 	r.POST("/people", addPerson)
 	r.GET("/galleries", listGalleries)
 	r.GET("/ws", handleWebSocket)
-	r.DELETE("/galleries/:id", deleteGallery)                     // Route for deleting galleries
+	r.DELETE("/galleries/:id", deleteGallery)
+	r.PUT("/galleries/:id", updateGallery)                        // Route for deleting galleries
 	r.POST("/galleries/:id/assign-person", assignPersonToGallery) // Route for assigning person to gallery
 	r.DELETE("/photos/:id", deletePhoto)
 
@@ -895,7 +896,7 @@ func listGalleries(c *gin.Context) {
 	var galleries []GalleryWithPeople
 
 	query := `
-        SELECT DISTINCT g.id, g.name, r.created_at, MIN(p.thumbnail_path) as thumbnail
+        SELECT DISTINCT g.id, g.name, r.url, r.created_at, MIN(p.thumbnail_path) as thumbnail
         FROM galleries g
 		JOIN requests r ON g.request_id = r.id
         JOIN photos p ON r.id = p.request_id
@@ -934,7 +935,7 @@ func listGalleries(c *gin.Context) {
 	for rows.Next() {
 		var g GalleryWithPeople
 		var thumbnail sql.NullString
-		if err := rows.Scan(&g.ID, &g.URL, &g.CreatedAt, &thumbnail); err != nil {
+		if err := rows.Scan(&g.ID, &g.Name, &g.URL, &g.CreatedAt, &thumbnail); err != nil {
 			log.Printf("Scan failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -1304,6 +1305,28 @@ func deletePhoto(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Photo deleted"})
+}
+
+func updateGallery(c *gin.Context) {
+	galleryIDStr := c.Param("id")
+	galleryID, err := strconv.Atoi(galleryIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid gallery id"})
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing or invalid name"})
+		return
+	}
+	_, err = db.Exec("UPDATE galleries SET name = ? WHERE id = ?", req.Name, galleryID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update gallery: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Gallery updated"})
 }
 
 func assignPersonToGallery(c *gin.Context) {
