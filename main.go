@@ -57,6 +57,9 @@ func main() {
 
 	db = initDB()
 
+    // Retroactively create galleries for all processed requests
+    createMissingGalleriesForProcessedRequests()
+
 	go func() {
 		for {
 			if err := checkAndRedownloadMissingFiles(); err != nil {
@@ -99,7 +102,41 @@ func main() {
 
 	log.Fatal(r.Run(":8081"))
 }
+func createMissingGalleriesForProcessedRequests() {
+	rows, err := db.Query("SELECT id, url FROM requests WHERE status = 'completed'")
+	if err != nil {
+		log.Printf("Error querying completed requests for gallery creation: %v", err)
+		return
+	}
+	defer rows.Close()
 
+	for rows.Next() {
+		var id int
+		var url string
+		if err := rows.Scan(&id, &url); err != nil {
+			log.Printf("Error scanning completed request: %v", err)
+			continue
+		}
+		var exists int
+		err = db.QueryRow("SELECT COUNT(*) FROM galleries WHERE request_id = ?", id).Scan(&exists)
+		if err != nil {
+			log.Printf("Error checking gallery existence for request %d: %v", id, err)
+			continue
+		}
+		if exists == 0 {
+			galleryName := url
+			if idx := strings.LastIndex(galleryName, "/"); idx != -1 {
+				galleryName = galleryName[idx+1:]
+			}
+			_, err = db.Exec("INSERT INTO galleries (request_id, name) VALUES (?, ?)", id, galleryName)
+			if err != nil {
+				log.Printf("Error creating gallery for request %d: %v", id, err)
+			} else {
+				log.Printf("Retroactively created gallery for request %d with name '%s'", id, galleryName)
+			}
+		}
+	}
+}
 func addPerson(c *gin.Context) {
 	var req Person
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -229,6 +266,25 @@ func processPendingDownloads() {
 						log.Printf("Error marking request %d as failed: %v", job.id, err)
 					}
 				} else {
+                    // Create a gallery entry for this request if not exists
+                    var exists int
+                    err = db.QueryRow("SELECT COUNT(*) FROM galleries WHERE request_id = ?", job.id).Scan(&exists)
+                    if err != nil {
+                        log.Printf("Error checking gallery existence for request %d: %v", job.id, err)
+                    }
+                    if exists == 0 {
+                        // Use the last part of the URL as a default name
+                        galleryName := job.url
+                        if idx := strings.LastIndex(galleryName, "/"); idx != -1 {
+                            galleryName = galleryName[idx+1:]
+                        }
+                        _, err = db.Exec("INSERT INTO galleries (request_id, name) VALUES (?, ?)", job.id, galleryName)
+                        if err != nil {
+                            log.Printf("Error creating gallery for request %d: %v", job.id, err)
+                        } else {
+                            log.Printf("Created gallery for request %d with name '%s'", job.id, galleryName)
+                        }
+                    }
 					_, err = db.Exec("UPDATE requests SET status = 'completed' WHERE id = ?", job.id)
 					if err != nil {
 						log.Printf("Error marking request %d as completed: %v", job.id, err)
