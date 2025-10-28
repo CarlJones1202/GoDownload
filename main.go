@@ -2,6 +2,8 @@ package main
 
 import (
 	"awesomeProject/similarity"
+	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -57,8 +59,8 @@ func main() {
 
 	db = initDB()
 
-    // Retroactively create galleries for all processed requests
-    createMissingGalleriesForProcessedRequests()
+	// Retroactively create galleries for all processed requests
+	createMissingGalleriesForProcessedRequests()
 
 	go func() {
 		for {
@@ -124,9 +126,13 @@ func createMissingGalleriesForProcessedRequests() {
 			continue
 		}
 		if exists == 0 {
-			galleryName := url
-			if idx := strings.LastIndex(galleryName, "/"); idx != -1 {
-				galleryName = galleryName[idx+1:]
+			// Try extractor service first, fallback to last URL segment
+			galleryName, err2 := callExtractName(url)
+			if err2 != nil || galleryName == "" {
+				galleryName = url
+				if idx := strings.LastIndex(galleryName, "/"); idx != -1 {
+					galleryName = galleryName[idx+1:]
+				}
 			}
 			_, err = db.Exec("INSERT INTO galleries (request_id, name) VALUES (?, ?)", id, galleryName)
 			if err != nil {
@@ -134,8 +140,81 @@ func createMissingGalleriesForProcessedRequests() {
 			} else {
 				log.Printf("Retroactively created gallery for request %d with name '%s'", id, galleryName)
 			}
+		} else {
+			// If gallery exists, ensure it has a meaningful name. If name is empty or looks like a default (last URL segment), try extractor.
+			var currentName sql.NullString
+			err = db.QueryRow("SELECT name FROM galleries WHERE request_id = ?", id).Scan(&currentName)
+			if err == nil {
+				needUpdate := false
+				cur := strings.TrimSpace(currentName.String)
+				if cur == "" {
+					needUpdate = true
+				} else {
+					// compare to last part of URL
+					last := url
+					if idx := strings.LastIndex(last, "/"); idx != -1 {
+						last = last[idx+1:]
+					}
+					if cur == last || cur == url {
+						needUpdate = true
+					}
+				}
+				if needUpdate {
+					if newName, err2 := callExtractName(url); err2 == nil && strings.TrimSpace(newName) != "" {
+						_, _ = db.Exec("UPDATE galleries SET name = ? WHERE request_id = ?", newName, id)
+						log.Printf("Updated gallery name for request %d to '%s'", id, newName)
+					}
+				}
+			}
 		}
 	}
+}
+
+// callExtractName contacts the local extractor service running on port 9090
+// It POSTs JSON {"title": <url>} and returns the extracted name.
+func callExtractName(urlStr string) (string, error) {
+	payload := map[string]string{"title": urlStr}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://localhost:9090/extract", bytes.NewReader(b))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	s := strings.TrimSpace(string(body))
+
+	// Try to decode JSON {"name": "..."} first
+	var m map[string]string
+	if err := json.Unmarshal(body, &m); err == nil {
+		if v, ok := m["name"]; ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v), nil
+		}
+		if v, ok := m["title"]; ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v), nil
+		}
+	}
+
+	if s != "" {
+		return s, nil
+	}
+	return "", fmt.Errorf("empty extractor response")
 }
 func addPerson(c *gin.Context) {
 	var req Person
@@ -266,25 +345,28 @@ func processPendingDownloads() {
 						log.Printf("Error marking request %d as failed: %v", job.id, err)
 					}
 				} else {
-                    // Create a gallery entry for this request if not exists
-                    var exists int
-                    err = db.QueryRow("SELECT COUNT(*) FROM galleries WHERE request_id = ?", job.id).Scan(&exists)
-                    if err != nil {
-                        log.Printf("Error checking gallery existence for request %d: %v", job.id, err)
-                    }
-                    if exists == 0 {
-                        // Use the last part of the URL as a default name
-                        galleryName := job.url
-                        if idx := strings.LastIndex(galleryName, "/"); idx != -1 {
-                            galleryName = galleryName[idx+1:]
-                        }
-                        _, err = db.Exec("INSERT INTO galleries (request_id, name) VALUES (?, ?)", job.id, galleryName)
-                        if err != nil {
-                            log.Printf("Error creating gallery for request %d: %v", job.id, err)
-                        } else {
-                            log.Printf("Created gallery for request %d with name '%s'", job.id, galleryName)
-                        }
-                    }
+					// Create a gallery entry for this request if not exists
+					var exists int
+					err = db.QueryRow("SELECT COUNT(*) FROM galleries WHERE request_id = ?", job.id).Scan(&exists)
+					if err != nil {
+						log.Printf("Error checking gallery existence for request %d: %v", job.id, err)
+					}
+					if exists == 0 {
+						// Try extractor service first, fallback to last URL segment
+						galleryName, err2 := callExtractName(job.url)
+						if err2 != nil || galleryName == "" {
+							galleryName = job.url
+							if idx := strings.LastIndex(galleryName, "/"); idx != -1 {
+								galleryName = galleryName[idx+1:]
+							}
+						}
+						_, err = db.Exec("INSERT INTO galleries (request_id, name) VALUES (?, ?)", job.id, galleryName)
+						if err != nil {
+							log.Printf("Error creating gallery for request %d: %v", job.id, err)
+						} else {
+							log.Printf("Created gallery for request %d with name '%s'", job.id, galleryName)
+						}
+					}
 					_, err = db.Exec("UPDATE requests SET status = 'completed' WHERE id = ?", job.id)
 					if err != nil {
 						log.Printf("Error marking request %d as completed: %v", job.id, err)
