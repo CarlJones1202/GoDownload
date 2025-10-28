@@ -158,6 +158,10 @@ func createMissingGalleriesForProcessedRequests() {
 					if cur == last || cur == url {
 						needUpdate = true
 					}
+					// If the current name looks like JSON (raw extractor response), re-run extractor
+					if strings.HasPrefix(cur, "{") || strings.HasPrefix(cur, "[") || strings.Contains(cur, "\"album\"") {
+						needUpdate = true
+					}
 				}
 				if needUpdate {
 					if newName, err2 := callExtractName(url); err2 == nil && strings.TrimSpace(newName) != "" {
@@ -200,14 +204,23 @@ func callExtractName(urlStr string) (string, error) {
 	}
 	s := strings.TrimSpace(string(body))
 
-	// Try to decode JSON {"name": "..."} first
-	var m map[string]string
+	// Try to decode JSON and prefer "album", then "name" or "title"
+	var m map[string]interface{}
 	if err := json.Unmarshal(body, &m); err == nil {
-		if v, ok := m["name"]; ok && strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v), nil
+		if v, ok := m["album"]; ok {
+			if str, ok := v.(string); ok && strings.TrimSpace(str) != "" {
+				return strings.TrimSpace(str), nil
+			}
 		}
-		if v, ok := m["title"]; ok && strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v), nil
+		if v, ok := m["name"]; ok {
+			if str, ok := v.(string); ok && strings.TrimSpace(str) != "" {
+				return strings.TrimSpace(str), nil
+			}
+		}
+		if v, ok := m["title"]; ok {
+			if str, ok := v.(string); ok && strings.TrimSpace(str) != "" {
+				return strings.TrimSpace(str), nil
+			}
 		}
 	}
 
