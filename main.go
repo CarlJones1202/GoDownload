@@ -2316,10 +2316,7 @@ func predictFeedbackHandler(c *gin.Context) {
 		}
 	}
 
-	predictorURL := "http://localhost:5000/feedback"
-	if filesCount+urlsCount > 1 {
-		predictorURL = "http://localhost:5000/feedback_batch"
-	}
+	predictorURL := "http://localhost:5000/feedback_batch"
 
 	req, err := http.NewRequest("POST", predictorURL, bytes.NewReader(bodyBytes))
 	if err != nil {
