@@ -97,6 +97,10 @@ func initDB() *sql.DB {
 			photo_path TEXT NOT NULL,
 			person_id INTEGER NOT NULL,
 			FOREIGN KEY (person_id) REFERENCES people(id)
+		);
+		CREATE TABLE IF NOT EXISTS predictor_tests (
+			photo_path TEXT PRIMARY KEY,
+			tested_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);`)
 	if err != nil {
 		log.Fatal(err)

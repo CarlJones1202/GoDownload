@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"bytes"
+	"mime/multipart"
 	"log"
 	"math/rand"
 	"net/http"
@@ -100,6 +102,8 @@ func main() {
 	r.GET("/photos/:id/similar", getSimilarPhotos)
 	r.GET("/photos/:id/feedback-candidates", getFeedbackCandidates)
 	r.GET("/training", trainingHandler)
+	r.POST("/predict_sample", predictSampleHandler)
+	r.POST("/predict_feedback", predictFeedbackHandler)
 	r.GET("/requests/pending", listPendingRequests) // New route for pending requests
 	r.GET("/photos/favorites", listFavoritePhotos)  // Route for favorite photos
 	r.DELETE("/requests/:id", deletePendingRequest)
@@ -2069,4 +2073,239 @@ func trainingHandler(c *gin.Context) {
 	if err := zw.Close(); err != nil {
 		log.Printf("error closing zip writer: %v", err)
 	}
+}
+
+// predictSampleHandler selects up to N untested photos (default 40), sends them
+// as multipart files to the external predictor's /predict_batch endpoint, and
+// returns the predictor response to the client. On a successful (200) response
+// the photos are recorded in predictor_tests so they won't be sent again.
+func predictSampleHandler(c *gin.Context) {
+	// allow override via ?count= param
+	count := 40
+	if cntStr := c.Query("count"); cntStr != "" {
+		if v, err := strconv.Atoi(cntStr); err == nil && v > 0 {
+			count = v
+		}
+	}
+
+	// Fetch untested photos
+	rows, err := db.Query(`
+		SELECT id, file_path FROM photos
+		WHERE file_path NOT IN (SELECT photo_path FROM predictor_tests)
+		ORDER BY RANDOM()
+		LIMIT ?
+	`, count)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query photos: " + err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	type item struct {
+		id int
+		path string
+	}
+	var items []item
+	for rows.Next() {
+		var it item
+		if err := rows.Scan(&it.id, &it.path); err == nil {
+			items = append(items, it)
+		}
+	}
+
+	if len(items) == 0 {
+		c.JSON(http.StatusOK, gin.H{"message": "no untested photos available"})
+		return
+	}
+
+	// Build multipart form with 'files' parts. Track which items were actually included.
+	var b bytes.Buffer
+	mw := multipart.NewWriter(&b)
+	var included []item
+	for _, it := range items {
+		f, err := os.Open(it.path)
+		if err != nil {
+			log.Printf("skipping missing file %s: %v", it.path, err)
+			continue
+		}
+		part, err := mw.CreateFormFile("files", filepath.Base(it.path))
+		if err != nil {
+			f.Close()
+			log.Printf("failed to create form file for %s: %v", it.path, err)
+			continue
+		}
+		if _, err := io.Copy(part, f); err != nil {
+			log.Printf("failed copying file %s into multipart: %v", it.path, err)
+			f.Close()
+			continue
+		}
+		f.Close()
+		included = append(included, it)
+	}
+	mw.Close()
+
+	if len(included) == 0 {
+		c.JSON(http.StatusOK, gin.H{"message": "no available files to send"})
+		return
+	}
+
+	// Send to predictor service
+	predictorURL := "http://localhost:5000/predict_batch"
+	req, err := http.NewRequest("POST", predictorURL, &b)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create request to predictor: " + err.Error()})
+		return
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	client := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to call predictor: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read predictor response: " + err.Error()})
+		return
+	}
+
+	// Try to decode predictor response as JSON
+	var parsed interface{}
+	if len(respBody) > 0 {
+		if err := json.Unmarshal(respBody, &parsed); err != nil {
+			parsed = string(respBody) // fallback to raw string
+		}
+	}
+
+	// Build sent list
+	sent := make([]map[string]string, len(included))
+	for i, it := range included {
+		sent[i] = map[string]string{
+			"photo_path": it.path,
+			"filename":   filepath.Base(it.path),
+		}
+	}
+
+	// Attempt to map per-item predictions when predictor returns a JSON array
+	var mapped []map[string]interface{}
+	if arr, ok := parsed.([]interface{}); ok && len(arr) == len(included) {
+		mapped = make([]map[string]interface{}, len(arr))
+		for i := range arr {
+			mapped[i] = map[string]interface{}{
+				"photo_path": sent[i]["photo_path"],
+				"filename":   sent[i]["filename"],
+				"prediction": arr[i],
+			}
+		}
+	}
+
+	// If predictor returned 200, mark included items as tested
+	if resp.StatusCode == http.StatusOK {
+		tx, err := db.Begin()
+		if err != nil {
+			log.Printf("failed to begin tx for marking predictor tests: %v", err)
+		} else {
+			for _, it := range included {
+				if _, err := tx.Exec("INSERT OR IGNORE INTO predictor_tests (photo_path) VALUES (?)", it.path); err != nil {
+					log.Printf("failed to mark %s as tested: %v", it.path, err)
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				log.Printf("failed to commit predictor_tests tx: %v", err)
+			}
+		}
+	}
+
+	// Return composite JSON to client
+	out := gin.H{
+		"sent":               sent,
+		"predictor_status":   resp.StatusCode,
+		"predictor_response": parsed,
+	}
+	if mapped != nil {
+		out["mapped"] = mapped
+	}
+
+	c.JSON(resp.StatusCode, out)
+}
+
+// predictFeedbackHandler forwards feedback (single or batch) to the external
+// predictor's /feedback endpoint. It returns which files/urls were forwarded
+// along with the predictor's response.
+func predictFeedbackHandler(c *gin.Context) {
+	predictorURL := "http://localhost:5000/feedback"
+
+	// Try to collect information about what was sent: files and url
+	var sentFiles []string
+	var sentURLs []string
+
+	// If this is multipart/form-data, use MultipartForm to list files
+	if c.Request.Method == "POST" {
+		// Parse multipart form if present (with a reasonable memory limit)
+		if err := c.Request.ParseMultipartForm(32 << 20); err == nil || c.Request.MultipartForm != nil {
+			if c.Request.MultipartForm != nil {
+				for k, fhs := range c.Request.MultipartForm.File {
+					for _, fh := range fhs {
+						sentFiles = append(sentFiles, fh.Filename)
+						// Note: we don't save the uploaded file here; we forward the raw body below
+						_ = k
+					}
+				}
+			}
+		}
+		// Also check for 'url' form field
+		if url := c.PostForm("url"); url != "" {
+			sentURLs = append(sentURLs, url)
+		}
+	}
+
+	// Read the full incoming request body so we can forward it
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body: " + err.Error()})
+		return
+	}
+
+	// Forward to predictor preserving content-type
+	req, err := http.NewRequest("POST", predictorURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create request to predictor: " + err.Error()})
+		return
+	}
+	if ct := c.Request.Header.Get("Content-Type"); ct != "" {
+		req.Header.Set("Content-Type", ct)
+	}
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to call predictor: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read predictor response: " + err.Error()})
+		return
+	}
+
+	var parsed interface{}
+	if len(respBody) > 0 {
+		if err := json.Unmarshal(respBody, &parsed); err != nil {
+			parsed = string(respBody)
+		}
+	}
+
+	out := gin.H{
+		"sent_files":         sentFiles,
+		"sent_urls":          sentURLs,
+		"predictor_status":   resp.StatusCode,
+		"predictor_response": parsed,
+	}
+
+	c.JSON(resp.StatusCode, out)
 }
