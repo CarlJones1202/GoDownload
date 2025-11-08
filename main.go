@@ -5,15 +5,16 @@ import (
 	// "bytes"
 	// "context"
 	"archive/zip"
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"image"
 	"io"
-	"bytes"
-	"mime/multipart"
 	"log"
 	"math/rand"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path"
@@ -2102,7 +2103,7 @@ func predictSampleHandler(c *gin.Context) {
 	defer rows.Close()
 
 	type item struct {
-		id int
+		id   int
 		path string
 	}
 	var items []item
@@ -2236,47 +2237,97 @@ func predictSampleHandler(c *gin.Context) {
 // predictor's /feedback endpoint. It returns which files/urls were forwarded
 // along with the predictor's response.
 func predictFeedbackHandler(c *gin.Context) {
-	predictorURL := "http://localhost:5000/feedback"
-
-	// Try to collect information about what was sent: files and url
-	var sentFiles []string
-	var sentURLs []string
-
-	// If this is multipart/form-data, use MultipartForm to list files
-	if c.Request.Method == "POST" {
-		// Parse multipart form if present (with a reasonable memory limit)
-		if err := c.Request.ParseMultipartForm(32 << 20); err == nil || c.Request.MultipartForm != nil {
-			if c.Request.MultipartForm != nil {
-				for k, fhs := range c.Request.MultipartForm.File {
-					for _, fh := range fhs {
-						sentFiles = append(sentFiles, fh.Filename)
-						// Note: we don't save the uploaded file here; we forward the raw body below
-						_ = k
-					}
-				}
-			}
-		}
-		// Also check for 'url' form field
-		if url := c.PostForm("url"); url != "" {
-			sentURLs = append(sentURLs, url)
-		}
-	}
-
-	// Read the full incoming request body so we can forward it
+	// Read the full incoming body first so we can forward it unchanged
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body: " + err.Error()})
 		return
 	}
 
-	// Forward to predictor preserving content-type
+	contentType := c.GetHeader("Content-Type")
+
+	filesCount := 0
+	urlsCount := 0
+	sentFiles := []string{}
+	sentURLs := []string{}
+
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		if _, params, perr := mime.ParseMediaType(contentType); perr == nil {
+			boundary := params["boundary"]
+			mr := multipart.NewReader(bytes.NewReader(bodyBytes), boundary)
+			for {
+				part, err := mr.NextPart()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					break
+				}
+				name := part.FormName()
+				filename := part.FileName()
+				if filename != "" {
+					filesCount++
+					sentFiles = append(sentFiles, filename)
+				} else {
+					pbody, _ := io.ReadAll(io.LimitReader(part, 4096))
+					s := strings.TrimSpace(string(pbody))
+					if name == "url" || name == "urls" || strings.HasPrefix(s, "http") {
+						urlsCount++
+						sentURLs = append(sentURLs, s)
+					}
+				}
+				part.Close()
+			}
+		}
+	} else if strings.HasPrefix(contentType, "application/json") {
+		var j interface{}
+		if err := json.Unmarshal(bodyBytes, &j); err == nil {
+			switch v := j.(type) {
+			case []interface{}:
+				urlsCount = len(v)
+			case map[string]interface{}:
+				if items, ok := v["items"]; ok {
+					if arr, ok2 := items.([]interface{}); ok2 {
+						urlsCount = len(arr)
+					}
+				} else if urls, ok := v["urls"]; ok {
+					if arr, ok2 := urls.([]interface{}); ok2 {
+						urlsCount = len(arr)
+					}
+				} else {
+					urlsCount = 1
+				}
+				if u, ok := v["urls"].([]interface{}); ok {
+					for _, ui := range u {
+						if s, ok := ui.(string); ok {
+							sentURLs = append(sentURLs, s)
+						}
+					}
+				}
+			default:
+				if len(bodyBytes) > 0 {
+					urlsCount = 1
+				}
+			}
+		}
+	} else {
+		if len(bodyBytes) > 0 {
+			urlsCount = 1
+		}
+	}
+
+	predictorURL := "http://localhost:5000/feedback"
+	if filesCount+urlsCount > 1 {
+		predictorURL = "http://localhost:5000/feedback_batch"
+	}
+
 	req, err := http.NewRequest("POST", predictorURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create request to predictor: " + err.Error()})
 		return
 	}
-	if ct := c.Request.Header.Get("Content-Type"); ct != "" {
-		req.Header.Set("Content-Type", ct)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 
 	client := &http.Client{Timeout: 60 * time.Second}
@@ -2300,9 +2351,84 @@ func predictFeedbackHandler(c *gin.Context) {
 		}
 	}
 
+	// If predictor returned an array that maps to the sent items, and any
+	// predictions indicate "liked", mark the corresponding photo(s) as
+	// favorited in our DB.
+	markLikes := func(identifier string) {
+		// try to resolve identifier as a photo file name first
+		var photoID int
+		// First try exact url match
+		err := db.QueryRow("SELECT id FROM photos WHERE url = ? LIMIT 1", identifier).Scan(&photoID)
+		if err != nil {
+			// fallback: match by filename within file_path
+			err = db.QueryRow("SELECT id FROM photos WHERE file_path LIKE ? ORDER BY created_at DESC LIMIT 1", "%"+identifier).Scan(&photoID)
+		}
+		if err == nil {
+			_, err2 := db.Exec("INSERT OR IGNORE INTO favorites (photo_id) VALUES (?)", photoID)
+			if err2 != nil {
+				log.Printf("failed to insert favorite for %s (id=%d): %v", identifier, photoID, err2)
+			} else {
+				log.Printf("marked photo id %d as favorite (identifier=%s)", photoID, identifier)
+			}
+		}
+	}
+
+	// helper to detect liked label in various predictor responses
+	isLiked := func(v interface{}) bool {
+		switch t := v.(type) {
+		case string:
+			s := strings.ToLower(t)
+			return strings.Contains(s, "like") || strings.Contains(s, "liked") || s == "positive" || s == "true"
+		case map[string]interface{}:
+			// look for common fields
+			for _, key := range []string{"label", "result", "prediction", "class"} {
+				if val, ok := t[key]; ok {
+					switch vv := val.(type) {
+					case string:
+						ss := strings.ToLower(vv)
+						if strings.Contains(ss, "like") || strings.Contains(ss, "liked") || ss == "positive" || ss == "true" {
+							return true
+						}
+					case map[string]interface{}:
+						if inner, ok := vv["label"].(string); ok {
+							il := strings.ToLower(inner)
+							if strings.Contains(il, "like") {
+								return true
+							}
+						}
+					}
+				}
+			}
+			return false
+		default:
+			return false
+		}
+	}
+
+	// Try mapping when parsed is an array and we have sent identifiers
+	if arr, ok := parsed.([]interface{}); ok {
+		// prefer mapping to files when present
+		if filesCount := len(sentFiles); filesCount > 0 && len(arr) == filesCount {
+			for i, entry := range arr {
+				if isLiked(entry) {
+					markLikes(sentFiles[i])
+				}
+			}
+		} else if urlsCount := len(sentURLs); urlsCount > 0 && len(arr) == urlsCount {
+			for i, entry := range arr {
+				if isLiked(entry) {
+					markLikes(sentURLs[i])
+				}
+			}
+		}
+	}
+
 	out := gin.H{
 		"sent_files":         sentFiles,
 		"sent_urls":          sentURLs,
+		"sent_files_count":   filesCount,
+		"sent_urls_count":    urlsCount,
+		"predictor_url":      predictorURL,
 		"predictor_status":   resp.StatusCode,
 		"predictor_response": parsed,
 	}
