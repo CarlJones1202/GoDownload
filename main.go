@@ -2091,8 +2091,9 @@ func predictSampleHandler(c *gin.Context) {
 
 	// Fetch untested photos
 	rows, err := db.Query(`
-		SELECT id, file_path FROM photos
-		WHERE file_path NOT IN (SELECT photo_path FROM predictor_tests)
+		SELECT p.id, p.file_path, f.created_at FROM photos p
+		OUTER LEFT JOIN favorites f ON p.id = f.photo_id
+		WHERE p.file_path NOT IN (SELECT photo_path FROM predictor_tests)
 		ORDER BY RANDOM()
 		LIMIT ?
 	`, count)
@@ -2103,13 +2104,14 @@ func predictSampleHandler(c *gin.Context) {
 	defer rows.Close()
 
 	type item struct {
-		id   int
-		path string
+		id        int
+		path      string
+		createdAt sql.NullString
 	}
 	var items []item
 	for rows.Next() {
 		var it item
-		if err := rows.Scan(&it.id, &it.path); err == nil {
+		if err := rows.Scan(&it.id, &it.path, &it.createdAt); err == nil {
 			items = append(items, it)
 		}
 	}
@@ -2185,8 +2187,10 @@ func predictSampleHandler(c *gin.Context) {
 	sent := make([]map[string]string, len(included))
 	for i, it := range included {
 		sent[i] = map[string]string{
-			"photo_path": it.path,
-			"filename":   filepath.Base(it.path),
+			"id":           strconv.Itoa(it.id),
+			"is_favorited": strconv.FormatBool(it.createdAt.Valid),
+			"photo_path":   it.path,
+			"filename":     filepath.Base(it.path),
 		}
 	}
 
