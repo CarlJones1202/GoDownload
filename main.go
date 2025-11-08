@@ -2,8 +2,9 @@ package main
 
 import (
 	"awesomeProject/similarity"
-	"bytes"
-	"context"
+	// "bytes"
+	// "context"
+	"archive/zip"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -98,6 +99,7 @@ func main() {
 	r.POST("/photos/:id/similarity-feedback", provideSimilarityFeedback)
 	r.GET("/photos/:id/similar", getSimilarPhotos)
 	r.GET("/photos/:id/feedback-candidates", getFeedbackCandidates)
+	r.GET("/training", trainingHandler)
 	r.GET("/requests/pending", listPendingRequests) // New route for pending requests
 	r.GET("/photos/favorites", listFavoritePhotos)  // Route for favorite photos
 	r.DELETE("/requests/:id", deletePendingRequest)
@@ -177,56 +179,6 @@ func createMissingGalleriesForProcessedRequests() {
 // callExtractName contacts the local extractor service running on port 9090
 // It POSTs JSON {"title": <url>} and returns the extracted name.
 func callExtractName(urlStr string) (string, error) {
-	payload := map[string]string{"title": urlStr}
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "POST", "http://localhost:9090/extract", bytes.NewReader(b))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	s := strings.TrimSpace(string(body))
-
-	// Try to decode JSON and prefer "album", then "name" or "title"
-	var m map[string]interface{}
-	if err := json.Unmarshal(body, &m); err == nil {
-		if v, ok := m["album"]; ok {
-			if str, ok := v.(string); ok && strings.TrimSpace(str) != "" {
-				return strings.TrimSpace(str), nil
-			}
-		}
-		if v, ok := m["name"]; ok {
-			if str, ok := v.(string); ok && strings.TrimSpace(str) != "" {
-				return strings.TrimSpace(str), nil
-			}
-		}
-		if v, ok := m["title"]; ok {
-			if str, ok := v.(string); ok && strings.TrimSpace(str) != "" {
-				return strings.TrimSpace(str), nil
-			}
-		}
-	}
-
-	if s != "" {
-		return s, nil
-	}
 	return "", fmt.Errorf("empty extractor response")
 }
 func addPerson(c *gin.Context) {
@@ -2019,4 +1971,102 @@ type PhotoWithTagsAndColors struct {
 	Tags      []string `json:"Tags"`
 	Colors    []string `json:"Colors"`
 	Favorited bool     `json:"favorited"`
+}
+
+// trainingHandler streams a zip containing two folders:
+// - likes/: every favorited image
+// - dislikes/: up to 40 random non-favorited images
+func trainingHandler(c *gin.Context) {
+	// Collect favorites
+	favRows, err := db.Query(`
+		SELECT p.file_path
+		FROM photos p
+		JOIN favorites f ON p.id = f.photo_id
+	`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query favorites: " + err.Error()})
+		return
+	}
+	defer favRows.Close()
+
+	var likes []string
+	for favRows.Next() {
+		var fp string
+		if err := favRows.Scan(&fp); err == nil {
+			likes = append(likes, fp)
+		}
+	}
+
+	// Collect up to 40 random non-favorited photos
+	nonFavRows, err := db.Query(`
+		SELECT file_path FROM photos
+		WHERE id NOT IN (SELECT photo_id FROM favorites)
+		ORDER BY RANDOM()
+		LIMIT 40
+	`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query non-favorites: " + err.Error()})
+		return
+	}
+	defer nonFavRows.Close()
+
+	var dislikes []string
+	for nonFavRows.Next() {
+		var fp string
+		if err := nonFavRows.Scan(&fp); err == nil {
+			dislikes = append(dislikes, fp)
+		}
+	}
+
+	// Prepare response headers for zip streaming
+	c.Writer.Header().Set("Content-Type", "application/zip")
+	fname := fmt.Sprintf("training_%d.zip", time.Now().Unix())
+	c.Writer.Header().Set("Content-Disposition", `attachment; filename="`+fname+`"`)
+
+	zw := zip.NewWriter(c.Writer)
+	defer func() {
+		_ = zw.Close()
+	}()
+
+	// helper to add a file to the zip under a given entry name
+	addFile := func(entryName, filePath string) error {
+		f, err := os.Open(filePath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		w, err := zw.Create(entryName)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(w, f)
+		return err
+	}
+
+	// Write likes
+	for i, fp := range likes {
+		base := filepath.Base(fp)
+		entry := fmt.Sprintf("likes/%d_%s", i+1, base)
+		if err := addFile(entry, fp); err != nil {
+			// skip missing or unreadable files but log
+			log.Printf("skipping like file %s: %v", fp, err)
+			continue
+		}
+	}
+
+	// Write dislikes
+	for i, fp := range dislikes {
+		base := filepath.Base(fp)
+		entry := fmt.Sprintf("dislikes/%d_%s", i+1, base)
+		if err := addFile(entry, fp); err != nil {
+			log.Printf("skipping dislike file %s: %v", fp, err)
+			continue
+		}
+	}
+
+	// Ensure zip is flushed
+	if err := zw.Close(); err != nil {
+		log.Printf("error closing zip writer: %v", err)
+	}
 }
