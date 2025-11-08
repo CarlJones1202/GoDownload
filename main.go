@@ -465,13 +465,17 @@ func extractAndStoreColors(filePath string) error {
 
 // Background service to tag photos
 func taggingService() {
+	skipped := 0
 	for {
 		rows, err := db.Query(`
             SELECT p.file_path, r.url 
             FROM photos p 
             JOIN requests r ON p.request_id = r.id 
             WHERE p.file_path NOT IN (SELECT photo_path FROM photo_tags) 
-            LIMIT 10`)
+            LIMIT 10
+			ORDER BY p.id
+			OFFSET ?
+			`, skipped)
 		if err != nil {
 			log.Printf("Error querying untagged photos: %v", err)
 			time.Sleep(10 * time.Second)
@@ -498,6 +502,7 @@ func taggingService() {
 					log.Printf("Error processing photo %s: %v", photoPath, err)
 				} else if err == ErrNoPersonMatch {
 					log.Printf("No matching person found for photo %s, will retry later", photoPath)
+					skipped++
 				}
 				// If ErrNoPersonMatch, do nothing: it will be retried next time
 			default:
