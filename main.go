@@ -472,9 +472,9 @@ func taggingService() {
             FROM photos p 
             JOIN requests r ON p.request_id = r.id 
             WHERE p.file_path NOT IN (SELECT photo_path FROM photo_tags) 
-            LIMIT 10
 			ORDER BY p.id
 			OFFSET ?
+            LIMIT 10
 			`, skipped)
 		if err != nil {
 			log.Printf("Error querying untagged photos: %v", err)
@@ -2101,7 +2101,7 @@ func predictSampleHandler(c *gin.Context) {
 		WHERE p.file_path NOT IN (SELECT photo_path FROM predictor_tests)
 		ORDER BY RANDOM()
 		LIMIT ?
-	`, count)
+	`, count*4)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query photos: " + err.Error()})
 		return
@@ -2131,6 +2131,10 @@ func predictSampleHandler(c *gin.Context) {
 	mw := multipart.NewWriter(&b)
 	var included []item
 	for _, it := range items {
+		if len(included) >= count {
+			break
+		}
+
 		f, err := os.Open(it.path)
 		if err != nil {
 			log.Printf("skipping missing file %s: %v", it.path, err)
