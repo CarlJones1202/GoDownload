@@ -2082,7 +2082,7 @@ func trainingHandler(c *gin.Context) {
 // the photos are recorded in predictor_tests so they won't be sent again.
 func predictSampleHandler(c *gin.Context) {
 	// allow override via ?count= param
-	count := 40
+	count := 20
 	if cntStr := c.Query("count"); cntStr != "" {
 		if v, err := strconv.Atoi(cntStr); err == nil && v > 0 {
 			count = v
